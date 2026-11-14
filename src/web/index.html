@@ -1,0 +1,486 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="theme-color" content="#111827">
+  <title>Yi · 概览</title>
+  <meta name="description" content="Yi 的实时概览与事件浏览：记录、事件、失败记录与消费者进度。">
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">跳到主要内容</a>
+
+  <div class="shell">
+    <aside class="sidebar" aria-label="侧栏">
+      <a class="brand" href="#/overview">Yi</a>
+
+      <nav class="sidebar-nav" aria-label="页面导航">
+        <a class="nav-item" href="#/overview" data-view="overview" aria-current="page">
+          <svg class="nav-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3.25" y="3.25" width="5.5" height="5.5" rx="1.25"></rect>
+            <rect x="11.25" y="3.25" width="5.5" height="5.5" rx="1.25"></rect>
+            <rect x="3.25" y="11.25" width="5.5" height="5.5" rx="1.25"></rect>
+            <rect x="11.25" y="11.25" width="5.5" height="5.5" rx="1.25"></rect>
+          </svg>
+          <span>概览</span>
+        </a>
+        <a class="nav-item" href="#/events" data-view="events">
+          <svg class="nav-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M7.5 5.5h9M7.5 10h9M7.5 14.5h9"></path>
+            <path d="M4 5.5h.01M4 10h.01M4 14.5h.01"></path>
+          </svg>
+          <span>事件</span>
+        </a>
+        <a class="nav-item" href="#/failures" data-view="failures">
+          <svg class="nav-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M10 3.25 17.1 16.25H2.9L10 3.25Z"></path>
+            <path d="M10 7.75v3.75"></path>
+            <path d="M10 14.25h.01"></path>
+          </svg>
+          <span>失败</span>
+        </a>
+      </nav>
+
+      <div class="sidebar-footer">
+        <div class="sidebar-status" id="sidebar-status" data-state="connecting" aria-hidden="true">
+          <span class="status-dot" aria-hidden="true"></span>
+          <span id="sidebar-connection-label">连接中</span>
+        </div>
+      </div>
+    </aside>
+
+    <div class="workspace">
+      <div class="mobile-bar">
+        <a class="mobile-brand" href="#/overview">Yi</a>
+        <nav class="mobile-tabs" aria-label="页面导航">
+          <a class="mobile-tab" href="#/overview" data-view="overview" aria-current="page">概览</a>
+          <a class="mobile-tab" href="#/events" data-view="events">事件</a>
+          <a class="mobile-tab" href="#/failures" data-view="failures">失败</a>
+        </nav>
+      </div>
+
+      <header class="toolbar">
+        <div class="toolbar-inner">
+          <div class="toolbar-heading">
+            <h1 class="toolbar-title" id="page-title" tabindex="-1">概览</h1>
+            <p class="toolbar-sub" id="page-sub">实时事件流与消费者进度</p>
+          </div>
+          <div class="connection-chip" id="connection" data-state="connecting" role="status" aria-live="polite">
+            <span class="status-dot" aria-hidden="true"></span>
+            <span id="connection-label">连接中</span>
+          </div>
+        </div>
+      </header>
+
+      <main class="canvas" id="main">
+        <noscript>
+          <p class="noscript">需要启用 JavaScript 才能接收实时事件和记录内容。</p>
+        </noscript>
+
+        <div class="stream-note" id="stream-note" role="status" aria-live="polite" hidden>
+          <svg viewBox="0 0 20 20" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="10" cy="10" r="6.75"></circle>
+            <path d="M10 6.25v4.25"></path>
+            <circle cx="10" cy="13.75" r="0.75" fill="currentColor" stroke="none"></circle>
+          </svg>
+          <p id="stream-note-text"></p>
+        </div>
+
+        <div class="view" id="view-overview">
+          <section class="kpis" aria-label="关键指标">
+            <article class="kpi-card">
+              <div class="kpi-head">
+                <p class="kpi-label">事件总数</p>
+                <svg class="kpi-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M10 3.25 16.75 6.5 10 9.75 3.25 6.5 10 3.25Z"></path>
+                  <path d="m3.25 10 6.75 3.25L16.75 10"></path>
+                  <path d="m3.25 13.5 6.75 3.25 6.75-3.25"></path>
+                </svg>
+              </div>
+              <p class="kpi-value" id="stat-events">—</p>
+              <p class="kpi-note">全部历史</p>
+            </article>
+
+            <article class="kpi-card">
+              <div class="kpi-head">
+                <p class="kpi-label">消费者</p>
+                <svg class="kpi-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <circle cx="7.5" cy="7" r="2.75"></circle>
+                  <path d="M2.75 16.25c0-2.6 2.1-4.25 4.75-4.25s4.75 1.65 4.75 4.25"></path>
+                  <path d="M13 4.75a2.6 2.6 0 0 1 0 4.5"></path>
+                  <path d="M14.25 12.2c1.75.5 3 1.9 3 4.05"></path>
+                </svg>
+              </div>
+              <p class="kpi-value" id="stat-consumers">—</p>
+              <p class="kpi-note">已注册</p>
+            </article>
+
+            <article class="kpi-card">
+              <div class="kpi-head">
+                <p class="kpi-label">待处理</p>
+                <svg class="kpi-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <circle cx="10" cy="10" r="6.75"></circle>
+                  <path d="M10 5.75V10l2.85 1.9"></path>
+                </svg>
+              </div>
+              <p class="kpi-value" id="stat-pending">—</p>
+              <p class="kpi-note">所有消费者合计</p>
+            </article>
+
+            <article class="kpi-card" id="kpi-failures">
+              <div class="kpi-head">
+                <p class="kpi-label">失败</p>
+                <svg class="kpi-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M10 3.25 17.1 16.25H2.9L10 3.25Z"></path>
+                  <path d="M10 7.75v3.75"></path>
+                  <path d="M10 14.25h.01"></path>
+                </svg>
+              </div>
+              <p class="kpi-value" id="stat-failures">—</p>
+              <p class="kpi-note">已放弃</p>
+            </article>
+          </section>
+
+          <section class="panel capture-panel" id="capture" aria-labelledby="capture-title">
+            <form class="capture-form" id="capture-form" novalidate>
+              <h2 class="sr-only" id="capture-title" tabindex="-1">快速记录</h2>
+
+              <div class="capture-row">
+                <label class="sr-only" for="capture-text">快速记录内容</label>
+                <textarea
+                  class="capture-textarea"
+                  id="capture-text"
+                  name="text"
+                  rows="1"
+                  placeholder="快速记录一件事…"
+                  required
+                  aria-describedby="capture-hint"
+                ></textarea>
+                <button class="button-primary capture-submit" id="capture-submit" type="submit" disabled>记录</button>
+              </div>
+
+              <div class="capture-meta">
+                <p class="capture-status" id="capture-status" role="status" aria-live="polite"></p>
+                <p class="capture-hint" id="capture-hint"><span id="key-mod">Ctrl</span> + Enter 记录</p>
+              </div>
+
+              <div class="capture-error" id="capture-error" role="alert" hidden>
+                <svg viewBox="0 0 20 20" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <circle cx="10" cy="10" r="6.75"></circle>
+                  <path d="M10 6.25v4.25"></path>
+                  <circle cx="10" cy="13.75" r="0.75" fill="currentColor" stroke="none"></circle>
+                </svg>
+                <span id="capture-error-text"></span>
+              </div>
+            </form>
+          </section>
+
+          <section class="panel producers-panel" id="producers" aria-labelledby="producers-title" aria-busy="true">
+            <div class="panel-head">
+              <div class="panel-heading">
+                <h2 class="panel-title" id="producers-title">生产者</h2>
+                <p class="panel-sub" id="producers-count">正在连接…</p>
+              </div>
+            </div>
+            <div class="panel-body">
+              <div class="producer-skeleton" id="producers-skeleton" aria-hidden="true">
+                <div class="producer-skeleton-row">
+                  <span class="skeleton-bar sk-producer-state"></span>
+                  <span class="skeleton-bar sk-producer-name"></span>
+                  <span class="skeleton-bar sk-producer-time"></span>
+                </div>
+                <div class="producer-skeleton-row">
+                  <span class="skeleton-bar sk-producer-state"></span>
+                  <span class="skeleton-bar sk-producer-name"></span>
+                  <span class="skeleton-bar sk-producer-time"></span>
+                </div>
+                <div class="producer-skeleton-row">
+                  <span class="skeleton-bar sk-producer-state"></span>
+                  <span class="skeleton-bar sk-producer-name"></span>
+                  <span class="skeleton-bar sk-producer-time"></span>
+                </div>
+              </div>
+              <ul class="producer-list" id="producer-list" hidden></ul>
+              <p class="producer-more" id="producers-more" hidden></p>
+              <div class="empty-state empty-compact" id="producers-empty" hidden>
+                <p class="empty-title" id="producers-empty-title">还没有生产者</p>
+                <p class="empty-text" id="producers-empty-text">发布事件后，这里会显示输入来源。</p>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel consumers-panel" id="consumers" aria-labelledby="consumers-title" aria-busy="true">
+            <div class="panel-head">
+              <div class="panel-heading">
+                <h2 class="panel-title" id="consumers-title">消费者</h2>
+                <p class="panel-sub" id="consumers-count">正在连接…</p>
+              </div>
+            </div>
+            <div class="panel-body">
+              <div class="consumer-skeleton" id="consumers-skeleton" aria-hidden="true">
+                <div class="consumer-skeleton-row">
+                  <span class="skeleton-bar sk-name"></span>
+                  <span class="skeleton-bar sk-line"></span>
+                </div>
+                <div class="consumer-skeleton-row">
+                  <span class="skeleton-bar sk-name"></span>
+                  <span class="skeleton-bar sk-line"></span>
+                </div>
+                <div class="consumer-skeleton-row">
+                  <span class="skeleton-bar sk-name"></span>
+                  <span class="skeleton-bar sk-line"></span>
+                </div>
+                <div class="consumer-skeleton-row">
+                  <span class="skeleton-bar sk-name"></span>
+                  <span class="skeleton-bar sk-line"></span>
+                </div>
+              </div>
+              <div class="consumer-grid" id="consumer-list"></div>
+              <div class="empty-state empty-compact" id="consumers-empty" hidden>
+                <p class="empty-title" id="consumers-empty-title">还没有消费者</p>
+                <p class="empty-text" id="consumers-empty-text">注册消费者后，这里会显示游标和投递进度。</p>
+              </div>
+            </div>
+          </section>
+        </div>
+
+        <div class="view" id="view-events" hidden>
+          <section class="panel events-page" id="events" aria-labelledby="events-title" aria-busy="true">
+            <div class="panel-head events-head">
+              <div class="panel-heading events-heading">
+                <div class="events-title-row">
+                  <h2 class="panel-title events-title" id="events-title" tabindex="-1">事件</h2>
+                  <button class="new-data-hint" id="events-new-data" type="button" hidden>有新数据</button>
+                </div>
+                <div class="events-meta">
+                  <p class="panel-sub" id="events-count">正在加载…</p>
+                  <p class="panel-sub events-page-info" id="events-page-info" hidden>第 1 / 1 页</p>
+                </div>
+              </div>
+              <div class="events-tools">
+                <div class="filters" id="filters" role="group" aria-label="按类型筛选" hidden></div>
+                <label class="page-size" for="page-size">
+                  <span class="page-size-label">每页</span>
+                  <select class="page-size-select" id="page-size" name="page-size">
+                    <option value="25">25 条</option>
+                    <option value="50" selected>50 条</option>
+                    <option value="100">100 条</option>
+                    <option value="200">200 条</option>
+                  </select>
+                </label>
+              </div>
+            </div>
+
+            <p class="sr-only" id="events-status" role="status" aria-live="polite"></p>
+
+            <div class="events-inline-error" id="events-inline-error" role="alert" hidden>
+              <svg viewBox="0 0 20 20" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="10" cy="10" r="6.75"></circle>
+                <path d="M10 6.25v4.25"></path>
+                <circle cx="10" cy="13.75" r="0.75" fill="currentColor" stroke="none"></circle>
+              </svg>
+              <p id="events-inline-error-text"></p>
+              <button class="inline-retry" id="events-retry" type="button">重试</button>
+            </div>
+
+            <div class="table-wrap" id="events-table-wrap">
+              <table class="event-table" id="event-table" hidden>
+                <caption class="sr-only">事件列表</caption>
+                <colgroup>
+                  <col class="col-type">
+                  <col class="col-source">
+                  <col class="col-content">
+                  <col class="col-time">
+                </colgroup>
+                <thead>
+                  <tr>
+                    <th scope="col">类型</th>
+                    <th scope="col">来源</th>
+                    <th scope="col">内容</th>
+                    <th scope="col" class="col-time-head">时间</th>
+                  </tr>
+                </thead>
+                <tbody id="event-rows"></tbody>
+              </table>
+
+              <div class="table-skeleton" id="events-skeleton" aria-hidden="true">
+                <div class="skeleton-row">
+                  <span class="skeleton-bar sk-chip"></span>
+                  <span class="skeleton-bar sk-source"></span>
+                  <span class="skeleton-bar sk-content"></span>
+                  <span class="skeleton-bar sk-time"></span>
+                </div>
+                <div class="skeleton-row">
+                  <span class="skeleton-bar sk-chip"></span>
+                  <span class="skeleton-bar sk-source"></span>
+                  <span class="skeleton-bar sk-content"></span>
+                  <span class="skeleton-bar sk-time"></span>
+                </div>
+                <div class="skeleton-row">
+                  <span class="skeleton-bar sk-chip"></span>
+                  <span class="skeleton-bar sk-source"></span>
+                  <span class="skeleton-bar sk-content"></span>
+                  <span class="skeleton-bar sk-time"></span>
+                </div>
+              </div>
+
+              <div class="empty-state" id="events-empty" hidden>
+                <div class="empty-icon" aria-hidden="true">
+                  <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M5.5 3.5h6.75L15 6.25v10.25H5.5V3.5Z"></path>
+                    <path d="M12.25 3.5v2.75H15"></path>
+                    <path d="M8 10h4.5M8 13h2.75"></path>
+                  </svg>
+                </div>
+                <p class="empty-title" id="events-empty-title">还没有事件</p>
+                <p class="empty-text" id="events-empty-text">到概览页用快速记录写下第一条，或在别处发布事件。</p>
+              </div>
+
+              <div class="empty-state" id="events-error" hidden>
+                <div class="empty-icon is-negative" aria-hidden="true">
+                  <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                    <circle cx="10" cy="10" r="6.75"></circle>
+                    <path d="M10 6.25v4.25"></path>
+                    <circle cx="10" cy="13.75" r="0.75" fill="currentColor" stroke="none"></circle>
+                  </svg>
+                </div>
+                <p class="empty-title">没能加载事件</p>
+                <p class="empty-text" id="events-error-text">请检查连接后重试。</p>
+              </div>
+            </div>
+
+            <div class="events-pagination" id="events-pagination" role="group" aria-label="事件分页" hidden>
+              <p class="pagination-total" id="pagination-total">共 — 条</p>
+              <div class="pagination-controls">
+                <button class="pagination-button" id="events-prev" type="button">上一页</button>
+                <p class="pagination-page" id="pagination-page" aria-live="polite" aria-atomic="true" aria-label="第 — 页">
+                  <span class="pagination-page-prefix">第</span>
+                  <span id="pagination-page-value">— / —</span>
+                  <span class="pagination-page-suffix">页</span>
+                </p>
+                <button class="pagination-button" id="events-next" type="button">下一页</button>
+              </div>
+            </div>
+          </section>
+        </div>
+
+        <div class="view" id="view-failures" hidden>
+          <section class="panel events-page failures-page" id="failures" aria-labelledby="failures-title" aria-busy="true">
+            <div class="panel-head failures-head">
+              <div class="panel-heading failures-heading">
+                <div class="failures-title-row">
+                  <h2 class="panel-title failures-title" id="failures-title" tabindex="-1">失败记录</h2>
+                  <button class="new-data-hint" id="failures-new-data" type="button" hidden>有新数据</button>
+                </div>
+                <div class="events-meta">
+                  <p class="panel-sub" id="failures-count">正在加载…</p>
+                  <p class="panel-sub events-page-info" id="failures-page-info" hidden>第 1 / 1 页</p>
+                </div>
+              </div>
+            </div>
+
+            <p class="sr-only" id="failures-status" role="status" aria-live="polite"></p>
+
+            <div class="events-inline-error" id="failures-inline-error" role="alert" hidden>
+              <svg viewBox="0 0 20 20" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="10" cy="10" r="6.75"></circle>
+                <path d="M10 6.25v4.25"></path>
+                <circle cx="10" cy="13.75" r="0.75" fill="currentColor" stroke="none"></circle>
+              </svg>
+              <p id="failures-inline-error-text"></p>
+              <button class="inline-retry" id="failures-retry" type="button">重试</button>
+            </div>
+
+            <div class="table-wrap" id="failures-table-wrap">
+              <table class="event-table failure-table" id="failure-table" hidden>
+                <caption class="sr-only">失败记录列表</caption>
+                <colgroup>
+                  <col class="col-f-consumer">
+                  <col class="col-f-event">
+                  <col class="col-f-source">
+                  <col class="col-f-error">
+                  <col class="col-f-time">
+                </colgroup>
+                <thead>
+                  <tr>
+                    <th scope="col">消费者</th>
+                    <th scope="col">事件</th>
+                    <th scope="col">来源</th>
+                    <th scope="col">错误</th>
+                    <th scope="col" class="col-time-head">时间</th>
+                  </tr>
+                </thead>
+                <tbody id="failure-rows"></tbody>
+              </table>
+
+              <div class="table-skeleton failure-skeleton" id="failures-skeleton" aria-hidden="true">
+                <div class="failure-skeleton-row">
+                  <span class="skeleton-bar sk-f-consumer"></span>
+                  <span class="skeleton-bar sk-f-event"></span>
+                  <span class="skeleton-bar sk-f-source"></span>
+                  <span class="skeleton-bar sk-f-error"></span>
+                  <span class="skeleton-bar sk-f-time"></span>
+                </div>
+                <div class="failure-skeleton-row">
+                  <span class="skeleton-bar sk-f-consumer"></span>
+                  <span class="skeleton-bar sk-f-event"></span>
+                  <span class="skeleton-bar sk-f-source"></span>
+                  <span class="skeleton-bar sk-f-error"></span>
+                  <span class="skeleton-bar sk-f-time"></span>
+                </div>
+                <div class="failure-skeleton-row">
+                  <span class="skeleton-bar sk-f-consumer"></span>
+                  <span class="skeleton-bar sk-f-event"></span>
+                  <span class="skeleton-bar sk-f-source"></span>
+                  <span class="skeleton-bar sk-f-error"></span>
+                  <span class="skeleton-bar sk-f-time"></span>
+                </div>
+              </div>
+
+              <div class="empty-state" id="failures-empty" hidden>
+                <div class="empty-icon" aria-hidden="true">
+                  <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M10 3.25 17.1 16.25H2.9L10 3.25Z"></path>
+                    <path d="M10 7.75v3.75"></path>
+                    <path d="M10 14.25h.01"></path>
+                  </svg>
+                </div>
+                <p class="empty-title" id="failures-empty-title">没有失败记录</p>
+                <p class="empty-text" id="failures-empty-text">被放弃的事件会记录在这里。</p>
+              </div>
+
+              <div class="empty-state" id="failures-error" hidden>
+                <div class="empty-icon is-negative" aria-hidden="true">
+                  <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                    <circle cx="10" cy="10" r="6.75"></circle>
+                    <path d="M10 6.25v4.25"></path>
+                    <circle cx="10" cy="13.75" r="0.75" fill="currentColor" stroke="none"></circle>
+                  </svg>
+                </div>
+                <p class="empty-title">没能加载失败记录</p>
+                <p class="empty-text" id="failures-error-text">请检查连接后重试。</p>
+              </div>
+            </div>
+
+            <div class="events-pagination" id="failures-pagination" role="group" aria-label="失败记录分页" hidden>
+              <p class="pagination-total" id="failures-pagination-total">共 — 条</p>
+              <div class="pagination-controls">
+                <button class="pagination-button" id="failures-prev" type="button">上一页</button>
+                <p class="pagination-page" id="failures-pagination-page" aria-live="polite" aria-atomic="true" aria-label="第 — 页">
+                  <span class="pagination-page-prefix">第</span>
+                  <span id="failures-page-value">— / —</span>
+                  <span class="pagination-page-suffix">页</span>
+                </p>
+                <button class="pagination-button" id="failures-next" type="button">下一页</button>
+              </div>
+            </div>
+          </section>
+        </div>
+      </main>
+    </div>
+  </div>
+</body>
+</html>

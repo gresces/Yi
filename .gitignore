@@ -1,0 +1,13 @@
+# 构建产物
+/dist/*
+!/dist/.gitkeep
+
+# 运行时数据
+/data/
+
+# Go
+*.test
+*.out
+
+# Agent
+.codegraph
