@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.1.1 — 2026-11-15
+
+### 客户端
+
+- Python 客户端合并为单文件 `lib/python/yi.py`,API 不变,仍零依赖。
+- 新增 C++17 单头文件客户端 `lib/cpp/yi.hpp`(libcurl + nlohmann/json)。
+- 新增 Rust 单文件客户端 `lib/rust/yi.rs`(标准库,零依赖)。
+- 新增 TypeScript 单文件客户端 `lib/ts/yi.ts`(标准 `fetch`,零运行时依赖)。
+
+### 服务端
+
+- 新增配置文件支持,默认 `/etc/yi/yi.config`;优先级为内置默认值 < 配置文件 < 命令行参数。
+- 新增 `yi install` / `yi uninstall`:安装 systemd unit、默认配置和二进制,支持 `-dry-run` / `-no-start`。
+- 服务端口 `GET /events` 支持 `type` 过滤。
+
+### 工程
+
+- 新增配置解析、systemd 安装和客户端测试。
+- Makefile 增加 TypeScript/Rust 测试目标。
+
 ## v0.1.0 — 2026-11-14
 
 首个可用版本。

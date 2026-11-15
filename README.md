@@ -2,7 +2,7 @@
 
 个人管理器:一条持久化的事件日志 + 若干拉取式消费者。server 形式,两个端口。
 
-当前版本 `0.1.0`,变更见 [CHANGELOG.md](CHANGELOG.md)。
+当前版本 `0.1.1`,变更见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 结构
 
@@ -10,9 +10,14 @@
 src/bus/        事件总线(事件、消费者、游标、SQLite 存储)
 src/web/        前端页面与资源,编译时嵌入二进制
 src/main.go     参数、两个 HTTP server、优雅退出
+src/config.go   配置文件解析与命令行合并
+src/install.go  systemd 服务安装/卸载
 src/frontend.go 前端端口:页面 + /api/*
 src/service.go  服务端口:JSON
-lib/python/     Python 客户端(生产者 + 消费者,零依赖)
+lib/python/     Python 客户端(单文件 yi.py,生产者 + 消费者,零依赖)
+lib/cpp/        C++17 单头文件客户端(libcurl + nlohmann/json)
+lib/rust/       Rust 单文件客户端(std,零依赖)
+lib/ts/         TypeScript 单文件客户端(fetch,零依赖)
 dist/           构建产物
 data/           运行时数据
 ```
@@ -27,10 +32,12 @@ go build -o dist/yi ./src
 ./dist/yi -host 0.0.0.0 -frontend-port 9000 -service-port 9001
 ./dist/yi -frontend=false                     # 只起服务端口
 ./dist/yi -data /var/lib/yi
+./dist/yi -config /etc/yi/yi.config           # 显式指定配置文件
 ```
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
+| `-config` | `/etc/yi/yi.config` | 配置文件路径 |
 | `-host` | `127.0.0.1` | 两个端口共用的监听地址 |
 | `-service-port` | `8081` | 服务端口 |
 | `-frontend-port` | `8080` | 前端端口 |
@@ -38,6 +45,69 @@ go build -o dist/yi ./src
 | `-data` | `data` | SQLite 数据库所在目录 |
 | `-archive-batch` | `256` | 归档批量;`0` 禁用归档 |
 | `-version` | — | 打印版本并退出 |
+
+## 配置文件
+
+默认路径 `/etc/yi/yi.config`。默认文件不存在时直接使用内置默认值;显式传入
+`-config` 但文件不存在会报错。优先级:**内置默认值 < 配置文件 < 命令行参数**。
+
+格式是简单的 `key = value`,键名与上面的参数一致,`-` 和 `_` 等价。空行和以
+`#`、`;` 开头的注释行会被忽略;值可以用单引号或双引号包起来(含空格时有用)。
+
+```ini
+# /etc/yi/yi.config
+host = 127.0.0.1
+service-port = 8081
+frontend-port = 8080
+frontend = true
+data = /var/lib/yi
+archive-batch = 256
+```
+
+`data` 是 SQLite 数据库目录。以 `yi install` 安装的 systemd 服务使用
+`/var/lib/yi`,并由 systemd 的 `StateDirectory` 自动创建和授权。
+
+## systemd 服务
+
+需要 root:
+
+```sh
+sudo ./dist/yi install
+sudo systemctl status yi
+```
+
+`yi install` 会:
+
+1. 把当前二进制安装到 `/usr/local/bin/yi`;
+2. 在 `/etc/yi/yi.config` 写入默认配置(已存在则保留);
+3. 写入 `/etc/systemd/system/yi.service`;
+4. 执行 `systemctl daemon-reload`、`enable` 和 `restart`。
+
+服务使用 `DynamicUser=yes` 和 `StateDirectory=yi`,不需要手工创建用户;
+数据默认在 `/var/lib/yi`。unit 里带了 `ProtectSystem=strict`、`ProtectHome`、
+`PrivateTmp`、`NoNewPrivileges`、`UMask=0077` 等基本加固。
+
+常用选项:
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `-config` | `/etc/yi/yi.config` | 生成的配置文件路径 |
+| `-unit-dir` | `/etc/systemd/system` | unit 文件目录 |
+| `-name` | `yi` | 服务名 |
+| `-bin` | `/usr/local/bin/yi` | 安装后的二进制路径 |
+| `-exec` | 当前进程 | 要复制的二进制 |
+| `-no-start` | 关 | 只写文件,不调用 `systemctl` |
+| `-dry-run` | 关 | 只打印生成内容,不写文件 |
+
+卸载:
+
+```sh
+sudo ./dist/yi uninstall
+```
+
+卸载会停止并禁用服务、删除 unit 文件,但保留二进制、配置和 `/var/lib/yi`
+数据。`yi install` 和 `yi uninstall` 都支持 `-no-start`(适合容器或无 systemd
+环境)和 `-dry-run`。
 
 ## 前端
 
@@ -110,6 +180,7 @@ POST /api/capture  {"text":"...","source":"web"}
 ```sh
 curl localhost:8081/healthz
 curl 'localhost:8081/events?limit=50'
+curl 'localhost:8081/events?limit=50&offset=0&type=note'
 curl localhost:8081/stats
 curl localhost:8081/failures
 
@@ -129,6 +200,8 @@ curl -X POST localhost:8081/events -H 'Content-Type: application/json' -d '{
 ```
 
 `matched` 是发布这一刻订阅了该类型的消费者数量。`0` 不是错误,只是“此刻没人接”;之后注册的消费者仍会读到历史事件。
+
+`/events` 的 `limit <= 0` 返回全部活跃事件;`type` 按“包含该类型”过滤,为空表示不筛选。
 
 ### 远程消费者
 
@@ -174,7 +247,90 @@ with Consumer(client, "classifier", ["raw.captured"]) as consumer:
             message.ack()
 ```
 
-详见 [lib/python/README.md](lib/python/README.md)。
+详见 [lib/python/README.md](lib/python/README.md)。客户端是单文件 `lib/python/yi.py`,没有第三方依赖。
+
+### C++ 客户端
+
+C++17 单头文件库,依赖 `libcurl` 与 `nlohmann/json`,生产者和拉取式消费者都有:
+
+```cpp
+#include "yi.hpp"
+
+yi::Client client("http://127.0.0.1:8081");
+
+yi::CaptureOptions capture;
+capture.source = "laptop";
+client.capture("随手记一句", capture);
+
+yi::Consumer consumer(client, "classifier", {"raw.captured"});
+while (auto message = consumer.next()) {
+    try {
+        handle(message->event());
+        message->ack();
+    } catch (const std::exception &error) {
+        message->nack(error.what());
+    }
+}
+```
+
+```sh
+c++ -std=c++17 -Ilib/cpp app.cpp -lcurl
+make -C lib/cpp test BASE_URL=http://127.0.0.1:8081
+```
+
+详见 [lib/cpp/README.md](lib/cpp/README.md)。
+
+### Rust 客户端
+
+单文件 `lib/rust/yi.rs`,零第三方依赖,自带 JSON 和 HTTP/1.1:
+
+```rust
+use yi::{Client, Consumer};
+
+let client = Client::new("http://127.0.0.1:8081")?;
+client.capture("随手记一句")?;
+
+let consumer = Consumer::new(&client, "classifier", ["raw.captured"])?;
+while let Some(message) = consumer.next()? {
+    message.ack()?;
+}
+```
+
+```sh
+cargo test --manifest-path lib/rust/Cargo.toml
+YI_BASE_URL=http://127.0.0.1:8081 \
+  cargo test --manifest-path lib/rust/Cargo.toml live_e2e -- --nocapture
+```
+
+详见 [lib/rust/README.md](lib/rust/README.md)。
+
+### TypeScript 客户端
+
+单文件 `lib/ts/yi.ts`,零运行时依赖,使用标准 `fetch`:
+
+```ts
+import { Client, Consumer } from "./lib/ts/yi.ts";
+
+const client = new Client("http://127.0.0.1:8081");
+await client.capture("随手记一句", { source: "laptop" });
+
+const consumer = await Consumer.open(client, "classifier", ["raw.captured"]);
+for await (const message of consumer) {
+    try {
+        await handle(message.event);
+        await message.ack();
+    } catch (error) {
+        await message.nack(error);
+    }
+}
+```
+
+```sh
+node --test lib/ts/tests/unit.test.mjs
+node --test lib/ts/tests/e2e.test.mjs   # 需要先启动服务
+```
+
+详见 [lib/ts/README.md](lib/ts/README.md)。
 
 ## 持久化
 
@@ -202,8 +358,13 @@ failures    Nack 记录
 ## 测试
 
 ```sh
-make test     # Go 单测 + Python 客户端测试
-make race     # go test -race
+make test         # Go 单测 + Python 客户端测试
+make ts-test      # TypeScript 单元测试
+make ts-e2e       # TypeScript 端到端测试,需要先启动服务
+make rust-test    # Rust 单元测试
+make rust-e2e     # Rust 端到端测试,需要先启动服务
+make -C lib/cpp test BASE_URL=http://127.0.0.1:8081  # C++ 单元 + 端到端
+make race         # go test -race
 make bench    # 核心路径基准
 make stress   # 压力测试,需要先启动服务
 make logic    # 模型对照的逻辑测试,需要空数据库

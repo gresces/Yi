@@ -218,6 +218,32 @@ func TestUnknownConsumer(t *testing.T) {
 	}
 }
 
+func TestEventsTypeFilter(t *testing.T) {
+	_, srv := newTestServer(t)
+
+	for id, typ := range map[string]string{"e1": "note", "e2": "raw.captured"} {
+		code, body := do(t, srv, http.MethodPost, "/events", map[string]any{
+			"id": id, "source": "test", "types": []string{typ},
+			"time": "2026-11-14T10:00:00+08:00", "data": map[string]string{"text": "x"},
+		})
+		if code != http.StatusCreated {
+			t.Fatalf("publish %s: %d %s", id, code, body)
+		}
+	}
+
+	code, body := do(t, srv, http.MethodGet, "/events?limit=10&type=raw.captured", nil)
+	if code != http.StatusOK {
+		t.Fatalf("events: %d %s", code, body)
+	}
+	var events []bus.Event
+	if err := json.Unmarshal(body, &events); err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].ID != "e2" {
+		t.Fatalf("unexpected filtered events: %s", body)
+	}
+}
+
 func TestPublishMatchedCount(t *testing.T) {
 	_, srv := newTestServer(t)
 

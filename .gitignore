@@ -11,3 +11,12 @@
 
 # Agent
 .codegraph
+
+# C++ client test binaries
+/lib/cpp/tests/test_unit
+/lib/cpp/tests/test_e2e
+
+# TypeScript
+/lib/ts/node_modules/
+/lib/ts/dist/
+/lib/ts/*.tsbuildinfo
