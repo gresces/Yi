@@ -114,6 +114,38 @@ fn main() -> Result<(), yi::Error> {
 - 未确认之前重复 `next()` 返回同一条事件,所以重试就是“不 ack 再取”。
 - `consumer.stats()?` 返回当前消费者的统计。
 
+### 正则订阅
+
+`types` 是精确匹配;需要按模式订阅时,用 `patterns` 传入 Go RE2 正则。两者按
+并集匹配,任意一个命中都会投递:
+
+```rust
+use yi::{Client, Consumer};
+
+fn main() -> Result<(), yi::Error> {
+    let client = Client::new("http://127.0.0.1:8081")?;
+
+    // 订阅 raw.captured,以及所有以 mail. 开头或恰好等于 note 的类型
+    let consumer = Consumer::with_patterns(
+        &client,
+        "mail-notes",
+        ["raw.captured"],
+        [r"^mail\.", r"^note$"],
+    )?;
+    Ok(())
+}
+```
+
+- 正则按事件类型逐个匹配;默认是**非锚定**的(服务端使用 Go 的
+  `MatchString`),需要整体匹配时自行加 `^`/`$`。
+- `types` 和 `patterns` 至少有一个非空,也可以只传模式:
+  `Consumer::with_patterns(&client, "mail", Vec::<String>::new(), [r"^mail\."])?`。
+- 服务端会 trim、排序、去重;非法或空模式返回 HTTP 400。
+- Go RE2 不支持反向引用和环视(lookaround)。
+- 自定义轮询超时用 `Consumer::with_patterns_and_timeout`;直接注册用
+  `Client::register_with_patterns`;`ConsumerStats::patterns` 可读到服务端
+  保存的模式(仅按类型订阅时为空)。
+
 ## 查询与管理
 
 ```rust
@@ -133,10 +165,31 @@ fn main() -> Result<(), yi::Error> {
     let failures = client.failures()?;
 
     client.register("debug", ["note"])?;
+    client.register_with_patterns("mail-debug", ["raw.captured"], [r"^mail\."])?;
     client.deregister("debug")?;
     Ok(())
 }
 ```
+
+## 认证
+
+服务端配置了 `auth-token` 后,所有服务端口请求都必须带
+`Authorization: Bearer <token>`。客户端默认不发送认证头;需要时用
+`Client::with_token`(或 `Client::with_token_and_timeout`)创建客户端:
+
+```rust
+use yi::Client;
+
+fn main() -> Result<(), yi::Error> {
+    let token = std::env::var("YI_TOKEN").expect("YI_TOKEN");
+    let client = Client::with_token("http://127.0.0.1:8081", token)?;
+    client.capture("带认证的一句")?;
+    Ok(())
+}
+```
+
+认证头会加在 health、发布、查询、消费者注册/长轮询/ack/nack 等所有请求上。
+服务端未配置 token 时继续使用 `Client::new`,行为与之前完全一致。
 
 ## 错误
 
@@ -169,7 +222,10 @@ cargo test
 
 # 对运行中的服务跑端到端测试
 YI_BASE_URL=http://127.0.0.1:8081 cargo test live_e2e -- --nocapture
+
+# 服务端启用 auth-token 时同时提供 token
+YI_BASE_URL=http://127.0.0.1:8081 YI_TOKEN=secret cargo test live_e2e -- --nocapture
 ```
 
-单元测试覆盖 JSON、模型、URL 编码和 HTTP 分块/Content-Length 响应;端到端测试默认
-跳过,只有设置 `YI_BASE_URL` 时才执行。
+单元测试覆盖 JSON、模型、URL 编码、HTTP 分块/Content-Length 响应以及认证头;
+端到端测试默认跳过,只有设置 `YI_BASE_URL` 时才执行。

@@ -75,6 +75,56 @@ if message is not None:
 长轮询默认等待 25 秒，可以通过 `Consumer(..., timeout=5)` 或
 `consumer.next(timeout=5)` 调整。服务端会把等待时间限制在 60 秒以内。
 
+### 正则订阅
+
+`types` 是精确匹配；`patterns` 是 Go RE2 正则表达式，对每个事件类型逐个匹配。
+一个事件只要命中任意一个 type **或** 任意一个 pattern 就会被投递（并集）。
+
+正则默认是**非锚定**的：`mail\.` 能匹配 `mail.received`，也能匹配
+`inbox.mail.received`。需要整串匹配时自行加 `^` 和 `$`，例如 `^note$`。
+只支持 Go RE2 语法，**不支持反向引用和环视**（`(?=...)`、`(?<=...)`）。
+
+```python
+from yi import Client, Consumer
+
+client = Client("http://127.0.0.1:8081")
+
+# 精确类型 + 正则，取并集
+consumer = Consumer(
+    client,
+    "classifier",
+    ["raw.captured"],
+    patterns=[r"^mail\.", r"^note$"],
+)
+
+# 只订阅正则:types 可以为空,但 types 和 patterns 不能同时为空
+notes = Consumer(client, "notes", [], patterns=[r"^note\."])
+
+# 也可以直接调用 register;patterns 为空时不会出现在请求体里
+client.register("debug", ["raw.captured"], patterns=[r"^debug\."])
+```
+
+服务端会 trim、排序、去重；非法正则或空正则会返回 HTTP 400
+（`HTTPError.status == 400`）。不传 `patterns` 或传空序列时，请求体只有
+`types`，与旧版服务端保持兼容。`ConsumerStats.patterns` 是对应的正则元组，
+旧版服务端不返回该字段时为空元组。
+
+## 认证
+
+服务端配置了 `auth-token` 时，服务端口的所有请求都必须带
+`Authorization: Bearer <token>`。构造客户端时传入同一个 token 即可：
+
+```python
+from yi import Client, Consumer
+
+client = Client("http://127.0.0.1:8081", token="0123456789abcdef0123456789abcdef")
+consumer = Consumer(client, "classifier", ["raw.captured"])
+```
+
+`Consumer`、`Message` 复用同一个 `Client`，因此 ack/nack 也自动带 token。
+`token` 默认为空字符串，此时不发送 `Authorization` 头，行为与未开启认证时
+完全一致。
+
 ## 错误处理
 
 ```python
@@ -118,6 +168,8 @@ python3 lib/python/stress/stress.py \
   --producers 6 --consumers 6 --events-per-producer 500 \
   --duplicate-every 50 --nack-rate 0.02
 ```
+
+服务开启认证时加 `--token <token>`，或设置环境变量 `YI_TOKEN`。
 
 常用参数：
 

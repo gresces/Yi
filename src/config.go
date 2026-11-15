@@ -22,6 +22,7 @@ type settings struct {
 	Frontend     bool
 	Data         string
 	ArchiveBatch int64
+	AuthToken    string
 }
 
 func defaultSettings() settings {
@@ -47,6 +48,9 @@ func (s settings) validate() error {
 	}
 	if s.FrontendPort < 0 || s.FrontendPort > 65535 {
 		return fmt.Errorf("frontend-port %d is out of range 0-65535", s.FrontendPort)
+	}
+	if err := validateAuthToken(s.AuthToken); err != nil {
+		return err
 	}
 	return nil
 }
@@ -80,6 +84,7 @@ func parseServerArgs(args []string, fallbackConfigPath string) (serverConfig, er
 	withFrontend := fs.Bool("frontend", defaults.Frontend, "是否启动前端")
 	dataDir := fs.String("data", defaults.Data, "数据目录")
 	archiveEvery := fs.Int64("archive-batch", defaults.ArchiveBatch, "归档批量;0 表示禁用归档")
+	authToken := fs.String("auth-token", defaults.AuthToken, "Bearer 认证令牌;为空表示关闭认证")
 
 	if err := fs.Parse(args); err != nil {
 		return serverConfig{}, err
@@ -138,6 +143,9 @@ func parseServerArgs(args []string, fallbackConfigPath string) (serverConfig, er
 	if explicit["archive-batch"] {
 		s.ArchiveBatch = *archiveEvery
 	}
+	if explicit["auth-token"] {
+		s.AuthToken = *authToken
+	}
 
 	if err := s.validate(); err != nil {
 		return serverConfig{}, err
@@ -166,6 +174,7 @@ var knownConfigKeys = map[string]struct{}{
 	"frontend":      {},
 	"data":          {},
 	"archive-batch": {},
+	"auth-token":    {},
 }
 
 // loadConfigFile reads a small key = value file. Blank lines and lines whose
@@ -277,6 +286,17 @@ func (c fileConfig) apply(s *settings) error {
 			return c.errorAt(value, "archive-batch: expected integer, got %q", value.text)
 		}
 		s.ArchiveBatch = parsed
+	}
+
+	if value, ok := c.values["auth-token"]; ok {
+		parsed, err := c.parseString(value)
+		if err != nil {
+			return err
+		}
+		if err := validateAuthToken(parsed); err != nil {
+			return c.errorAt(value, "%v", err)
+		}
+		s.AuthToken = parsed
 	}
 
 	return nil

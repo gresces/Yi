@@ -70,6 +70,50 @@ for (const auto &message : consumer) {
 长轮询默认 25 秒,服务端会把等待时间限制在 60 秒以内。未确认之前重复 `next()`
 返回同一条事件,所以重试就是“不 ack 再取”。
 
+### 正则订阅
+
+`types` 是精确匹配;`ConsumerOptions::patterns` 是 Go RE2 正则表达式,对每个
+事件类型逐个匹配。事件命中任意一个 type **或** 任意一个 pattern 即投递(并集)。
+
+正则默认**非锚定**:`mail\.` 同时匹配 `mail.received` 和
+`inbox.mail.received`;需要整串匹配时自己加 `^`/`$`。只支持 Go RE2,
+**不支持反向引用和环视**。
+
+```cpp
+yi::ConsumerOptions options;
+options.poll_timeout = std::chrono::seconds(25);
+options.patterns = {R"(^mail\.)", R"(^note$)"};
+
+// 精确类型 + 正则
+yi::Consumer consumer(client, "classifier", {"raw.captured"}, options);
+
+// 只订阅正则:types 可以为空,但不能和 patterns 同时为空
+yi::Consumer notes(client, "notes", {}, options);
+
+// 直接注册也可以;patterns 为空时请求体不含该字段
+client.register_consumer("debug", {"raw.captured"}, {R"(^debug\.)"});
+```
+
+服务端会 trim、排序、去重;非法或空正则返回 HTTP 400。`Consumer::patterns()`
+返回规范化后的本地副本,`ConsumerStats::patterns` 是服务端返回的订阅正则。
+
+## 认证
+
+服务端配置了 `auth-token` 时,服务端口的所有请求都必须带
+`Authorization: Bearer <token>`。把同一个 token 放进 `ClientOptions` 即可:
+
+```cpp
+yi::ClientOptions options;
+options.token = "0123456789abcdef0123456789abcdef";              // 留空则不发 Authorization 头
+
+yi::Client client("http://127.0.0.1:8081", options);
+yi::Consumer consumer(client, "classifier", {"raw.captured"});
+```
+
+`Consumer` 和 `Message` 内部持有 `Client` 的副本,所以 token 会随复制/移动一起
+保留;ack、nack、长轮询等所有请求都会带上同一个头。`options.token` 默认为空
+字符串,此时行为与未开启认证的服务完全一致。
+
 ## 查询与管理
 
 ```cpp
@@ -117,4 +161,9 @@ make -C lib/cpp test BASE_URL=http://127.0.0.1:8081
 ```
 
 `test` 会先跑不需要服务端的单元测试,再对运行中的服务跑端到端测试。端到端测试
-使用唯一类型和消费者名,可以跑在已有数据的数据库上。
+使用唯一类型和消费者名,可以跑在已有数据的数据库上。服务开启认证时,通过环境
+变量传入同一个 token:
+
+```sh
+YI_TOKEN=s3cret make -C lib/cpp test BASE_URL=http://127.0.0.1:8081
+```

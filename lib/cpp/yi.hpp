@@ -39,7 +39,7 @@ namespace yi {
 
 using json = nlohmann::json;
 
-inline constexpr std::string_view version = "0.1.1";
+inline constexpr std::string_view version = "0.1.5";
 inline constexpr std::chrono::milliseconds default_request_timeout{10000};
 inline constexpr std::chrono::milliseconds default_poll_timeout{25000};
 
@@ -108,6 +108,29 @@ inline std::vector<std::string> normalize_types(std::vector<std::string> types) 
     normalized.erase(std::unique(normalized.begin(), normalized.end()),
                      normalized.end());
     return normalized;
+}
+
+// Subscription patterns share the server's trim/sort/dedupe normalization.
+// The pattern syntax itself (Go RE2) is validated by the server.
+inline std::vector<std::string>
+normalize_patterns(std::vector<std::string> patterns) {
+    return normalize_types(std::move(patterns));
+}
+
+inline json register_body(std::vector<std::string> types,
+                          std::vector<std::string> patterns) {
+    types = normalize_types(std::move(types));
+    patterns = normalize_patterns(std::move(patterns));
+    if (types.empty() && patterns.empty()) {
+        throw Error("consumer needs at least one type or pattern");
+    }
+
+    json body;
+    body["types"] = types;
+    if (!patterns.empty()) {
+        body["patterns"] = patterns;
+    }
+    return body;
 }
 
 inline std::string random_id() {
@@ -266,10 +289,20 @@ inline std::size_t write_callback(char *ptr, std::size_t size,
     return bytes;
 }
 
+// Returns the Authorization header line for a bearer token, or nullopt when
+// the token is empty (authentication disabled).
+inline std::optional<std::string> authorization_header(std::string_view token) {
+    if (token.empty()) {
+        return std::nullopt;
+    }
+    return std::string("Authorization: Bearer ") + std::string(token);
+}
+
 inline Response http_request(std::string_view base_url,
                              std::string_view method, std::string_view path,
                              const std::optional<std::string> &body,
-                             std::chrono::milliseconds timeout) {
+                             std::chrono::milliseconds timeout,
+                             std::string_view token = {}) {
     ensure_curl();
     if (timeout.count() <= 0) {
         throw Error("request timeout must be positive");
@@ -300,6 +333,9 @@ inline Response http_request(std::string_view base_url,
     };
 
     add_header("Accept: application/json");
+    if (const auto authorization = authorization_header(token)) {
+        add_header(authorization->c_str());
+    }
     if (body) {
         add_header("Content-Type: application/json");
     }
@@ -322,7 +358,7 @@ inline Response http_request(std::string_view base_url,
     set_opt(handle.get(), CURLOPT_TIMEOUT_MS,
             static_cast<long>(timeout.count()));
     set_opt(handle.get(), CURLOPT_NOSIGNAL, 1L);
-    set_opt(handle.get(), CURLOPT_USERAGENT, "yi-cpp/0.1.1");
+    set_opt(handle.get(), CURLOPT_USERAGENT, "yi-cpp/0.1.5");
 
     const CURLcode code = curl_easy_perform(handle.get());
     if (code != CURLE_OK) {
@@ -472,6 +508,8 @@ struct PublishResult {
 struct ConsumerStats {
     std::string name;
     std::vector<std::string> types;
+    // Go RE2 subscription patterns; older servers omit the field.
+    std::vector<std::string> patterns;
     long long cursor = 0;
     long long pending = 0;
     long long delivered = 0;
@@ -506,6 +544,18 @@ struct ConsumerStats {
                 }
             }
         }
+
+        const auto *patterns = detail::find_field(value, "patterns");
+        if (patterns != nullptr && !patterns->is_null()) {
+            if (!patterns->is_array()) {
+                throw Error("consumer stats patterns must be a JSON array");
+            }
+            for (const auto &item : *patterns) {
+                if (item.is_string()) {
+                    stats.patterns.push_back(item.get<std::string>());
+                }
+            }
+        }
         return stats;
     }
 
@@ -516,6 +566,9 @@ struct ConsumerStats {
                    {"pending", pending},
                    {"delivered", delivered},
                    {"failed", failed}};
+        if (!patterns.empty()) {
+            value["patterns"] = patterns;
+        }
         if (last_error) {
             value["last_error"] = *last_error;
         }
@@ -566,10 +619,16 @@ struct CaptureOptions {
 
 struct ClientOptions {
     std::chrono::milliseconds request_timeout = default_request_timeout;
+    // Bearer token for the service port. Empty means no Authorization header,
+    // which matches a server without an auth-token configured.
+    std::string token;
 };
 
 struct ConsumerOptions {
     std::chrono::milliseconds poll_timeout = default_poll_timeout;
+    // Go RE2 patterns matched against each event type. Combined with the
+    // exact types passed to the Consumer constructor (union semantics).
+    std::vector<std::string> patterns;
 };
 
 // ---- client ---------------------------------------------------------------
@@ -589,10 +648,15 @@ public:
         if (options_.request_timeout.count() <= 0) {
             throw Error("request timeout must be positive");
         }
+        if (options_.token.find('\r') != std::string::npos ||
+            options_.token.find('\n') != std::string::npos) {
+            throw Error("auth token must not contain CR or LF");
+        }
         detail::ensure_curl();
     }
 
     const std::string &base_url() const noexcept { return base_url_; }
+    const ClientOptions &options() const noexcept { return options_; }
 
     std::string health() const {
         const auto response =
@@ -680,18 +744,14 @@ public:
         return result;
     }
 
-    ConsumerStats register_consumer(std::string_view name,
-                                    std::vector<std::string> types) const {
+    ConsumerStats register_consumer(
+        std::string_view name, std::vector<std::string> types,
+        std::vector<std::string> patterns = {}) const {
         if (name.empty()) {
             throw Error("consumer name is required");
         }
-        types = detail::normalize_types(std::move(types));
-        if (types.empty()) {
-            throw Error("consumer needs at least one type");
-        }
-
-        json body;
-        body["types"] = types;
+        json body = detail::register_body(std::move(types),
+                                          std::move(patterns));
         const std::string path = detail::consumer_path(name);
         const auto response = request("PUT", path,
                                       detail::dump_json(body, "register"),
@@ -779,7 +839,8 @@ private:
         std::optional<std::string> body,
         std::optional<std::chrono::milliseconds> timeout) const {
         return detail::http_request(base_url_, method, path, body,
-                                    timeout.value_or(options_.request_timeout));
+                                    timeout.value_or(options_.request_timeout),
+                                    options_.token);
     }
 
     PublishResult publish_json(const json &event) const {
@@ -852,17 +913,18 @@ public:
              std::vector<std::string> types, ConsumerOptions options = {})
         : client_(client), name_(std::move(name)),
           types_(detail::normalize_types(std::move(types))),
-          options_(options) {
+          patterns_(detail::normalize_patterns(std::move(options.patterns))),
+          options_(std::move(options)) {
         if (name_.empty()) {
             throw Error("consumer name is required");
         }
-        if (types_.empty()) {
-            throw Error("consumer needs at least one type");
+        if (types_.empty() && patterns_.empty()) {
+            throw Error("consumer needs at least one type or pattern");
         }
         if (options_.poll_timeout.count() <= 0) {
             throw Error("poll timeout must be positive");
         }
-        client_.register_consumer(name_, types_);
+        client_.register_consumer(name_, types_, patterns_);
     }
 
     ~Consumer() = default;
@@ -872,7 +934,8 @@ public:
 
     Consumer(Consumer &&other) noexcept
         : client_(std::move(other.client_)), name_(std::move(other.name_)),
-          types_(std::move(other.types_)), options_(other.options_),
+          types_(std::move(other.types_)),
+          patterns_(std::move(other.patterns_)), options_(other.options_),
           closed_(other.closed_) {
         other.closed_ = true;
     }
@@ -883,6 +946,9 @@ public:
 
     const std::string &name() const noexcept { return name_; }
     const std::vector<std::string> &types() const noexcept { return types_; }
+    const std::vector<std::string> &patterns() const noexcept {
+        return patterns_;
+    }
     bool closed() const noexcept { return closed_; }
 
     ConsumerStats stats() const {
@@ -928,6 +994,7 @@ private:
     Client client_;
     std::string name_;
     std::vector<std::string> types_;
+    std::vector<std::string> patterns_;
     ConsumerOptions options_;
     bool closed_ = false;
 };

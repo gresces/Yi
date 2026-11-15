@@ -43,6 +43,8 @@ export interface PublishResult {
 export interface ConsumerStats {
   name: string;
   types: string[];
+  /** Regex subscription patterns reported by the server, when any. */
+  patterns?: string[];
   cursor: number;
   pending: number;
   delivered: number;
@@ -84,11 +86,21 @@ export interface ClientOptions {
   fetch?: typeof fetch;
   /** Extra HTTP headers for every request. */
   headers?: Record<string, string>;
+  /**
+   * Optional bearer token. When set, every request carries
+   * `Authorization: Bearer <token>`.
+   */
+  token?: string;
 }
 
 export interface ConsumerOptions {
   /** Long-poll wait for `Consumer.next`, in milliseconds. */
   pollTimeoutMs?: number;
+  /**
+   * Go RE2 patterns matched against each event type. Combined with `types`
+   * using union semantics; either may be empty, but not both.
+   */
+  patterns?: readonly string[];
 }
 
 // ---- errors ---------------------------------------------------------------
@@ -220,6 +232,25 @@ function optionalString(value: unknown): string | null | undefined {
   return undefined;
 }
 
+function parseStringArray(
+  raw: unknown,
+  what: string,
+): string[] | undefined {
+  if (raw === undefined || raw === null) {
+    return undefined;
+  }
+  if (!Array.isArray(raw)) {
+    throw new YiError(`${what} must be a JSON array`);
+  }
+  const items: string[] = [];
+  for (const item of raw) {
+    if (typeof item === "string") {
+      items.push(item);
+    }
+  }
+  return items;
+}
+
 function parseJson(text: string, what: string): unknown {
   try {
     return JSON.parse(text) as unknown;
@@ -286,18 +317,11 @@ function parseConsumerStats(value: unknown): ConsumerStats {
     throw new YiError("consumer stats must be a JSON object");
   }
 
-  const types: string[] = [];
-  const rawTypes = value.types;
-  if (rawTypes !== undefined && rawTypes !== null) {
-    if (!Array.isArray(rawTypes)) {
-      throw new YiError("consumer stats types must be a JSON array");
-    }
-    for (const item of rawTypes) {
-      if (typeof item === "string") {
-        types.push(item);
-      }
-    }
-  }
+  const types = parseStringArray(value.types, "consumer stats types") ?? [];
+  const patterns = parseStringArray(
+    value.patterns,
+    "consumer stats patterns",
+  );
 
   const stats: ConsumerStats = {
     name: stringValue(value.name),
@@ -307,6 +331,10 @@ function parseConsumerStats(value: unknown): ConsumerStats {
     delivered: numberValue(value.delivered),
     failed: numberValue(value.failed),
   };
+
+  if (patterns !== undefined) {
+    stats.patterns = patterns;
+  }
 
   const lastError = optionalString(value.last_error);
   if (lastError !== undefined) {
@@ -475,8 +503,21 @@ export class Client {
     }
     this.fetchImpl = fetchImpl;
 
+    const token = options.token;
+    if (token !== undefined && typeof token !== "string") {
+      throw new YiError("auth token must be a string");
+    }
+    if (token !== undefined && (token.includes("\r") || token.includes("\n"))) {
+      throw new YiError("auth token must not contain CR or LF");
+    }
+    const bearer: Record<string, string> =
+      token !== undefined && token.trim() !== ""
+        ? { Authorization: `Bearer ${token}` }
+        : {};
+
     this.defaultHeaders = {
       Accept: "application/json",
+      ...bearer,
       ...(options.headers ?? {}),
     };
   }
@@ -564,21 +605,39 @@ export class Client {
     return parseJsonArray(response.body, "failures").map(parseFailure);
   }
 
+  /**
+   * Register a consumer with exact types and/or Go RE2 patterns.
+   *
+   * Patterns match each event type (unanchored unless `^`/`$` are used) and
+   * are combined with `types` using union semantics. At least one non-empty
+   * type or pattern is required. Patterns are only added to the request body
+   * when non-empty.
+   */
   async register(
     name: string,
     types: readonly string[],
+    patterns: readonly string[] = [],
   ): Promise<ConsumerStats> {
     const consumer = requireName(name);
     const normalized = normalizeTypes(types);
-    if (normalized.length === 0) {
-      throw new YiError("consumer needs at least one type");
+    // Patterns follow the same trim/dedupe/sort rules as types.
+    const normalizedPatterns = normalizeTypes(patterns);
+    if (normalized.length === 0 && normalizedPatterns.length === 0) {
+      throw new YiError("consumer needs at least one type or pattern");
+    }
+
+    const body: { types: string[]; patterns?: string[] } = {
+      types: normalized,
+    };
+    if (normalizedPatterns.length > 0) {
+      body.patterns = normalizedPatterns;
     }
 
     const path = consumerPath(consumer);
     const response = await this.request(
       "PUT",
       path,
-      { types: normalized },
+      body,
       this.requestTimeoutMs,
     );
     expectStatus(response, [200, 201], "PUT", this.baseUrl + path);
@@ -756,6 +815,7 @@ export class Message {
 export class Consumer implements AsyncIterable<Message> {
   readonly name: string;
   readonly types: ReadonlyArray<string>;
+  readonly patterns: ReadonlyArray<string>;
   readonly pollTimeoutMs: number;
 
   private readonly client: Client;
@@ -770,8 +830,9 @@ export class Consumer implements AsyncIterable<Message> {
     this.client = client;
     this.name = requireName(name);
     this.types = normalizeTypes(types);
-    if (this.types.length === 0) {
-      throw new YiError("consumer needs at least one type");
+    this.patterns = normalizeTypes(options.patterns ?? []);
+    if (this.types.length === 0 && this.patterns.length === 0) {
+      throw new YiError("consumer needs at least one type or pattern");
     }
 
     const pollTimeoutMs = options.pollTimeoutMs ?? client.pollTimeoutMs;
@@ -784,6 +845,9 @@ export class Consumer implements AsyncIterable<Message> {
   /**
    * Register `name` on the server and return a local consumer.
    *
+   * Pass regex patterns through `options.patterns`; they are combined with
+   * `types` using union semantics and either list may be empty (but not both).
+   *
    * Construction is async because the server registration is an HTTP call.
    */
   static async open(
@@ -793,7 +857,7 @@ export class Consumer implements AsyncIterable<Message> {
     options: ConsumerOptions = {},
   ): Promise<Consumer> {
     const consumer = new Consumer(client, name, types, options);
-    await client.register(consumer.name, consumer.types);
+    await client.register(consumer.name, consumer.types, consumer.patterns);
     return consumer;
   }
 

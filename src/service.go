@@ -14,7 +14,7 @@ import (
 )
 
 // serviceHandler 是机器接口:JSON 进,JSON 出。
-func serviceHandler(b *bus.Bus) http.Handler {
+func serviceHandler(b *bus.Bus, a *auth) http.Handler {
 	mux := http.NewServeMux()
 
 	// ---- 事件 ----
@@ -61,28 +61,35 @@ func serviceHandler(b *bus.Bus) http.Handler {
 		name := r.PathValue("name")
 
 		var body struct {
-			Types []bus.EventType `json:"types"`
+			Types    []bus.EventType `json:"types"`
+			Patterns []string        `json:"patterns"`
 		}
 		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			writeErr(w, http.StatusBadRequest, "invalid json: "+err.Error())
 			return
 		}
-		if len(body.Types) == 0 {
-			writeErr(w, http.StatusBadRequest, "types is required")
+		patterns, err := bus.NormalizePatterns(body.Patterns)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if len(body.Types) == 0 && len(patterns) == 0 {
+			writeErr(w, http.StatusBadRequest, "types or patterns is required")
 			return
 		}
 
 		if c, ok := b.Consumer(name); ok {
-			if sameTypes(c.Types(), body.Types) {
+			if sameTypes(c.Types(), body.Types) &&
+				sameStrings(c.Patterns(), patterns) {
 				writeJSON(w, http.StatusOK, c.Stats())
 				return
 			}
-			writeErr(w, http.StatusConflict, "consumer exists with different types")
+			writeErr(w, http.StatusConflict, "consumer exists with different subscription")
 			return
 		}
 
-		c, err := b.Subscribe(name, body.Types...)
+		c, err := b.SubscribePatterns(name, body.Types, patterns)
 		if err != nil {
 			writeErr(w, http.StatusBadRequest, err.Error())
 			return
@@ -154,7 +161,13 @@ func serviceHandler(b *bus.Bus) http.Handler {
 		_, _ = w.Write([]byte("ok\n"))
 	})
 
-	return mux
+	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		_, _ = w.Write([]byte(renderPrometheus(b.PrometheusStats(), version)))
+	})
+
+	return a.wrap(mux, authPublicService, false)
 }
 
 // settle 处理 ack / nack。body 可选,但带上 id 会校验它确实是当前 inflight 的事件。
@@ -212,8 +225,26 @@ func sameTypes(a, b []bus.EventType) bool {
 	return true
 }
 
+func sameStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	set := make(map[string]struct{}, len(a))
+	for _, value := range a {
+		set[value] = struct{}{}
+	}
+	for _, value := range b {
+		if _, ok := set[value]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Vary", "Cookie")
 	w.WriteHeader(status)
 	enc := json.NewEncoder(w)
 	enc.SetEscapeHTML(false)

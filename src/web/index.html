@@ -10,8 +10,99 @@
   <link rel="stylesheet" href="/static/app.css">
   <script src="/static/app.js" defer></script>
 </head>
-<body>
+<body class="is-auth-locked">
   <a class="skip-link" href="#main">跳到主要内容</a>
+
+  <div class="auth-screen" id="auth-screen" role="dialog" aria-modal="true" aria-labelledby="auth-title" aria-describedby="auth-sub">
+    <div class="auth-card">
+      <div class="auth-aside" aria-hidden="true">
+        <div class="auth-aside-top">
+          <span class="auth-brand">Yi</span>
+          <span class="auth-aside-badge">个人事件日志</span>
+        </div>
+        <div class="auth-aside-body">
+          <p class="auth-aside-title">记录发生过的事，<br>让它们继续流动。</p>
+          <p class="auth-aside-text">事件、消费者与失败记录，都留在一个安静的地方。</p>
+        </div>
+        <p class="auth-aside-foot">本地保存 · 实时推送 · 随时回看</p>
+      </div>
+
+      <div class="auth-main">
+        <div class="auth-heading">
+          <p class="auth-eyebrow">
+            <svg viewBox="0 0 20 20" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="4.75" y="8.75" width="10.5" height="7.5" rx="2"></rect>
+              <path d="M7.25 8.75V6.5a2.75 2.75 0 0 1 5.5 0v2.25"></path>
+            </svg>
+            <span>安全访问</span>
+          </p>
+          <h1 class="auth-title" id="auth-title" tabindex="-1">登录 Yi</h1>
+          <p class="auth-sub" id="auth-sub">输入访问令牌，继续查看事件与消费者进度。</p>
+        </div>
+
+        <div class="auth-checking" id="auth-checking">
+          <span class="auth-spinner" aria-hidden="true"></span>
+          <span class="auth-checking-text" id="auth-checking-text" role="status" aria-live="polite">正在确认登录状态…</span>
+        </div>
+
+        <div class="auth-form-wrap" id="auth-form-wrap" hidden>
+          <form class="auth-form" id="login-form" novalidate>
+            <label class="auth-label" for="auth-token">访问令牌</label>
+            <div class="auth-field">
+              <input
+                class="auth-input"
+                id="auth-token"
+                name="token"
+                type="password"
+                autocomplete="current-password"
+                spellcheck="false"
+                autocapitalize="off"
+                autocorrect="off"
+                required
+                aria-describedby="auth-error auth-hint"
+              >
+              <button class="auth-reveal" id="auth-reveal" type="button" aria-pressed="false" aria-label="显示令牌" title="显示令牌">
+                <svg class="is-eye" viewBox="0 0 20 20" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M2.75 10s2.5-4.25 7.25-4.25S17.25 10 17.25 10s-2.5 4.25-7.25 4.25S2.75 10 2.75 10Z"></path>
+                  <circle cx="10" cy="10" r="2"></circle>
+                </svg>
+                <svg class="is-eye-off" viewBox="0 0 20 20" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M2.75 10s2.5-4.25 7.25-4.25c1.15 0 2.17.28 3.05.72"></path>
+                  <path d="M15.95 7.55c.82.85 1.3 1.6 1.3 1.6s-2.5 4.25-7.25 4.25c-1.1 0-2.09-.26-2.95-.68"></path>
+                  <path d="M3.5 3.5l13 13"></path>
+                  <path d="M8.15 8.15A2 2 0 0 0 10 12"></path>
+                </svg>
+              </button>
+            </div>
+
+            <div class="auth-error" id="auth-error" role="alert" aria-live="assertive" aria-atomic="true" hidden>
+              <svg viewBox="0 0 20 20" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="10" cy="10" r="6.75"></circle>
+                <path d="M10 6.25v4.25"></path>
+                <circle cx="10" cy="13.75" r="0.75" fill="currentColor" stroke="none"></circle>
+              </svg>
+              <span id="auth-error-text"></span>
+            </div>
+
+            <button class="button-primary auth-submit" id="auth-submit" type="submit">
+              <span class="auth-submit-spinner" aria-hidden="true"></span>
+              <span class="auth-submit-label" id="auth-submit-label">登录</span>
+              <svg class="auth-submit-arrow" viewBox="0 0 20 20" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M4.5 10h11"></path>
+                <path d="m11 5.5 4.5 4.5-4.5 4.5"></path>
+              </svg>
+            </button>
+
+            <p class="auth-hint" id="auth-hint">令牌只用于本次登录，不会留在页面里。</p>
+          </form>
+        </div>
+
+        <noscript>
+          <p class="auth-noscript">需要启用 JavaScript 才能登录。</p>
+        </noscript>
+      </div>
+    </div>
+  </div>
 
   <div class="shell">
     <aside class="sidebar" aria-label="侧栏">
@@ -49,6 +140,13 @@
           <span class="status-dot" aria-hidden="true"></span>
           <span id="sidebar-connection-label">连接中</span>
         </div>
+        <button class="logout-button" id="logout-button" type="button" hidden>
+          <svg class="logout-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M10 3.25v6.5"></path>
+            <path d="M6.2 5.6a6 6 0 1 0 7.6 0"></path>
+          </svg>
+          <span id="logout-label">退出登录</span>
+        </button>
       </div>
     </aside>
 
@@ -60,6 +158,12 @@
           <a class="mobile-tab" href="#/events" data-view="events">事件</a>
           <a class="mobile-tab" href="#/failures" data-view="failures">失败</a>
         </nav>
+        <button class="mobile-logout" id="mobile-logout" type="button" hidden aria-label="退出登录" title="退出登录">
+          <svg viewBox="0 0 20 20" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M10 3.25v6.5"></path>
+            <path d="M6.2 5.6a6 6 0 1 0 7.6 0"></path>
+          </svg>
+        </button>
       </div>
 
       <header class="toolbar">
@@ -181,26 +285,54 @@
           <section class="panel producers-panel" id="producers" aria-labelledby="producers-title" aria-busy="true">
             <div class="panel-head">
               <div class="panel-heading">
-                <h2 class="panel-title" id="producers-title">生产者</h2>
+                <h2 class="panel-title" id="producers-title" tabindex="-1">生产者</h2>
                 <p class="panel-sub" id="producers-count">正在连接…</p>
+              </div>
+              <label class="panel-select-all" for="producers-select-all">
+                <input type="checkbox" id="producers-select-all" aria-label="全选生产者" disabled>
+                <span>全选</span>
+              </label>
+            </div>
+            <div class="selection-bar" id="producers-selection" hidden>
+              <p class="selection-count" id="producers-selection-count" role="status" aria-live="polite">已选 0 个来源</p>
+              <div class="selection-actions">
+                <button class="selection-clear" id="producers-selection-clear" type="button" aria-label="取消选择来源">取消选择</button>
+                <button class="selection-delete" id="producers-bulk-delete" type="button" aria-label="删除所选来源">
+                  <svg viewBox="0 0 20 20" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M4.5 5.75h11"></path>
+                    <path d="M8 5.75V4.5h4v1.25"></path>
+                    <path d="m6 5.75.75 9h6.5l.75-9"></path>
+                    <path d="M8.75 8.75v3.5M11.25 8.75v3.5"></path>
+                  </svg>
+                  删除所选
+                </button>
               </div>
             </div>
             <div class="panel-body">
               <div class="producer-skeleton" id="producers-skeleton" aria-hidden="true">
                 <div class="producer-skeleton-row">
+                  <span class="skeleton-bar sk-select"></span>
                   <span class="skeleton-bar sk-producer-state"></span>
                   <span class="skeleton-bar sk-producer-name"></span>
+                  <span class="skeleton-bar sk-producer-count"></span>
                   <span class="skeleton-bar sk-producer-time"></span>
+                  <span class="skeleton-bar sk-action"></span>
                 </div>
                 <div class="producer-skeleton-row">
+                  <span class="skeleton-bar sk-select"></span>
                   <span class="skeleton-bar sk-producer-state"></span>
                   <span class="skeleton-bar sk-producer-name"></span>
+                  <span class="skeleton-bar sk-producer-count"></span>
                   <span class="skeleton-bar sk-producer-time"></span>
+                  <span class="skeleton-bar sk-action"></span>
                 </div>
                 <div class="producer-skeleton-row">
+                  <span class="skeleton-bar sk-select"></span>
                   <span class="skeleton-bar sk-producer-state"></span>
                   <span class="skeleton-bar sk-producer-name"></span>
+                  <span class="skeleton-bar sk-producer-count"></span>
                   <span class="skeleton-bar sk-producer-time"></span>
+                  <span class="skeleton-bar sk-action"></span>
                 </div>
               </div>
               <ul class="producer-list" id="producer-list" hidden></ul>
@@ -215,8 +347,27 @@
           <section class="panel consumers-panel" id="consumers" aria-labelledby="consumers-title" aria-busy="true">
             <div class="panel-head">
               <div class="panel-heading">
-                <h2 class="panel-title" id="consumers-title">消费者</h2>
+                <h2 class="panel-title" id="consumers-title" tabindex="-1">消费者</h2>
                 <p class="panel-sub" id="consumers-count">正在连接…</p>
+              </div>
+              <label class="panel-select-all" for="consumers-select-all">
+                <input type="checkbox" id="consumers-select-all" aria-label="全选消费者" disabled>
+                <span>全选</span>
+              </label>
+            </div>
+            <div class="selection-bar" id="consumers-selection" hidden>
+              <p class="selection-count" id="consumers-selection-count" role="status" aria-live="polite">已选 0 个消费者</p>
+              <div class="selection-actions">
+                <button class="selection-clear" id="consumers-selection-clear" type="button" aria-label="取消选择消费者">取消选择</button>
+                <button class="selection-delete" id="consumers-bulk-delete" type="button" aria-label="删除所选消费者">
+                  <svg viewBox="0 0 20 20" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M4.5 5.75h11"></path>
+                    <path d="M8 5.75V4.5h4v1.25"></path>
+                    <path d="m6 5.75.75 9h6.5l.75-9"></path>
+                    <path d="M8.75 8.75v3.5M11.25 8.75v3.5"></path>
+                  </svg>
+                  删除所选
+                </button>
               </div>
             </div>
             <div class="panel-body">
@@ -274,6 +425,27 @@
               </div>
             </div>
 
+            <label class="events-mobile-select panel-select-all" for="events-select-all-mobile">
+              <input type="checkbox" id="events-select-all-mobile" aria-label="全选当前页事件" disabled>
+              <span>全选本页</span>
+            </label>
+
+            <div class="selection-bar" id="events-selection" hidden>
+              <p class="selection-count" id="events-selection-count" role="status" aria-live="polite">已选 0 条</p>
+              <div class="selection-actions">
+                <button class="selection-clear" id="events-selection-clear" type="button" aria-label="取消选择事件">取消选择</button>
+                <button class="selection-delete" id="events-bulk-delete" type="button" aria-label="删除所选事件">
+                  <svg viewBox="0 0 20 20" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M4.5 5.75h11"></path>
+                    <path d="M8 5.75V4.5h4v1.25"></path>
+                    <path d="m6 5.75.75 9h6.5l.75-9"></path>
+                    <path d="M8.75 8.75v3.5M11.25 8.75v3.5"></path>
+                  </svg>
+                  删除所选
+                </button>
+              </div>
+            </div>
+
             <p class="sr-only" id="events-status" role="status" aria-live="polite"></p>
 
             <div class="events-inline-error" id="events-inline-error" role="alert" hidden>
@@ -287,20 +459,42 @@
             </div>
 
             <div class="table-wrap" id="events-table-wrap">
-              <table class="event-table" id="event-table" hidden>
+              <table class="event-table resizable-table" id="event-table" hidden>
                 <caption class="sr-only">事件列表</caption>
                 <colgroup>
-                  <col class="col-type">
-                  <col class="col-source">
+                  <col class="col-select">
+                  <col class="col-type" data-column="type">
+                  <col class="col-source" data-column="source">
                   <col class="col-content">
-                  <col class="col-time">
+                  <col class="col-time" data-column="time">
+                  <col class="col-actions">
                 </colgroup>
                 <thead>
                   <tr>
-                    <th scope="col">类型</th>
-                    <th scope="col">来源</th>
-                    <th scope="col">内容</th>
-                    <th scope="col" class="col-time-head">时间</th>
+                    <th scope="col" class="cell-select">
+                      <label class="row-check">
+                        <input type="checkbox" id="events-select-all" disabled aria-label="选择当前页全部事件">
+                      </label>
+                    </th>
+                    <th scope="col" class="resizable-head" data-column="type">
+                      <span class="th-label">类型</span>
+                      <span class="col-resizer" role="separator" tabindex="0" aria-orientation="vertical" aria-label="调整类型列宽" data-column="type"></span>
+                    </th>
+                    <th scope="col" class="resizable-head" data-column="source">
+                      <span class="th-label">来源</span>
+                      <span class="col-resizer" role="separator" tabindex="0" aria-orientation="vertical" aria-label="调整来源列宽" data-column="source"></span>
+                    </th>
+                    <th scope="col" class="resizable-head" data-column="content">
+                      <span class="th-label">内容</span>
+                      <span class="col-resizer" role="separator" tabindex="0" aria-orientation="vertical" aria-label="调整内容列宽" data-column="content"></span>
+                    </th>
+                    <th scope="col" class="col-time-head resizable-head" data-column="time">
+                      <span class="th-label">时间</span>
+                      <span class="col-resizer" role="separator" tabindex="0" aria-orientation="vertical" aria-label="调整时间列宽" data-column="time"></span>
+                    </th>
+                    <th scope="col" class="cell-actions">
+                      <span class="sr-only">操作</span>
+                    </th>
                   </tr>
                 </thead>
                 <tbody id="event-rows"></tbody>
@@ -308,22 +502,28 @@
 
               <div class="table-skeleton" id="events-skeleton" aria-hidden="true">
                 <div class="skeleton-row">
+                  <span class="skeleton-bar sk-select"></span>
                   <span class="skeleton-bar sk-chip"></span>
                   <span class="skeleton-bar sk-source"></span>
                   <span class="skeleton-bar sk-content"></span>
                   <span class="skeleton-bar sk-time"></span>
+                  <span class="skeleton-bar sk-action"></span>
                 </div>
                 <div class="skeleton-row">
+                  <span class="skeleton-bar sk-select"></span>
                   <span class="skeleton-bar sk-chip"></span>
                   <span class="skeleton-bar sk-source"></span>
                   <span class="skeleton-bar sk-content"></span>
                   <span class="skeleton-bar sk-time"></span>
+                  <span class="skeleton-bar sk-action"></span>
                 </div>
                 <div class="skeleton-row">
+                  <span class="skeleton-bar sk-select"></span>
                   <span class="skeleton-bar sk-chip"></span>
                   <span class="skeleton-bar sk-source"></span>
                   <span class="skeleton-bar sk-content"></span>
                   <span class="skeleton-bar sk-time"></span>
+                  <span class="skeleton-bar sk-action"></span>
                 </div>
               </div>
 
@@ -480,7 +680,104 @@
           </section>
         </div>
       </main>
+
+      <div class="logout-alert" id="logout-alert" role="alert" aria-live="assertive" aria-atomic="true" hidden>
+        <svg class="logout-alert-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="10" cy="10" r="6.75"></circle>
+          <path d="M10 6.25v4.25"></path>
+          <circle cx="10" cy="13.75" r="0.75" fill="currentColor" stroke="none"></circle>
+        </svg>
+        <p class="logout-alert-text" id="logout-alert-text"></p>
+        <div class="logout-alert-actions">
+          <button class="logout-alert-retry" id="logout-alert-retry" type="button" aria-describedby="logout-alert-text">重试</button>
+          <button class="logout-alert-dismiss" id="logout-alert-dismiss" type="button" aria-label="关闭提示" title="关闭提示">
+            <svg viewBox="0 0 20 20" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <path d="m6 6 8 8"></path>
+              <path d="m14 6-8 8"></path>
+            </svg>
+          </button>
+        </div>
+      </div>
     </div>
   </div>
+
+  <p class="sr-only" id="delete-status" role="status" aria-live="polite" aria-atomic="true"></p>
+
+  <dialog class="confirm-dialog" id="confirm-dialog" aria-labelledby="confirm-title" aria-describedby="confirm-message confirm-warning">
+    <div class="confirm-head">
+      <div class="confirm-icon" aria-hidden="true">
+        <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M10 3.25 17.1 16.25H2.9L10 3.25Z"></path>
+          <path d="M10 7.75v3.75"></path>
+          <path d="M10 14.25h.01"></path>
+        </svg>
+      </div>
+      <div class="confirm-copy">
+        <h2 class="confirm-title" id="confirm-title">确认删除</h2>
+        <p class="confirm-message" id="confirm-message"></p>
+      </div>
+    </div>
+    <p class="confirm-warning" id="confirm-warning" hidden></p>
+    <div class="confirm-error" id="confirm-error" role="alert" aria-live="assertive" aria-atomic="true" hidden>
+      <svg viewBox="0 0 20 20" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="10" cy="10" r="6.75"></circle>
+        <path d="M10 6.25v4.25"></path>
+        <circle cx="10" cy="13.75" r="0.75" fill="currentColor" stroke="none"></circle>
+      </svg>
+      <span id="confirm-error-text"></span>
+    </div>
+    <div class="confirm-actions">
+      <button class="button-ghost" id="confirm-cancel" type="button">取消</button>
+      <button class="button-danger" id="confirm-submit" type="button">删除</button>
+    </div>
+  </dialog>
+
+  <dialog class="event-detail-dialog" id="event-detail-dialog" aria-modal="true" aria-labelledby="event-detail-title">
+    <div class="event-detail-head">
+      <div class="event-detail-heading">
+        <h2 class="event-detail-title" id="event-detail-title">事件详情</h2>
+        <p class="event-detail-kicker">事件的完整字段与原始数据</p>
+      </div>
+      <button class="event-detail-close" id="event-detail-close" type="button" aria-label="关闭事件详情" title="关闭">
+        <svg viewBox="0 0 20 20" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="m6 6 8 8"></path>
+          <path d="m14 6-8 8"></path>
+        </svg>
+      </button>
+    </div>
+    <div class="event-detail-body" id="event-detail-body">
+      <dl class="event-detail-meta">
+        <div class="event-detail-item is-wide">
+          <dt>类型</dt>
+          <dd>
+            <div class="type-chips" id="event-detail-types"></div>
+          </dd>
+        </div>
+        <div class="event-detail-item">
+          <dt>来源</dt>
+          <dd><span class="event-detail-mono" id="event-detail-source">—</span></dd>
+        </div>
+        <div class="event-detail-item">
+          <dt>事件 ID</dt>
+          <dd><span class="event-detail-mono" id="event-detail-id">—</span></dd>
+        </div>
+        <div class="event-detail-item is-wide">
+          <dt>时间</dt>
+          <dd>
+            <time id="event-detail-time">—</time>
+            <span class="event-detail-raw" id="event-detail-time-raw" hidden></span>
+          </dd>
+        </div>
+      </dl>
+      <div class="event-detail-section">
+        <div class="event-detail-section-head">
+          <h3 class="event-detail-section-title" id="event-detail-data-title">完整数据</h3>
+          <button class="event-detail-copy" id="event-detail-copy" type="button">复制 JSON</button>
+        </div>
+        <pre class="event-detail-json" id="event-detail-json" tabindex="0" aria-labelledby="event-detail-data-title"></pre>
+        <p class="event-detail-status" id="event-detail-status" role="status" aria-live="polite" aria-atomic="true"></p>
+      </div>
+    </div>
+  </dialog>
 </body>
 </html>

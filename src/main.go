@@ -20,7 +20,7 @@ import (
 	"yi/src/bus"
 )
 
-var version = "0.1.1"
+var version = "0.1.5"
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -76,6 +76,7 @@ func runServer(args []string) error {
 	}
 
 	s := cfg.Settings
+	authn := newAuth(s.AuthToken)
 	bus.SetArchiveBatch(s.ArchiveBatch)
 
 	b, err := bus.Open(s.Data)
@@ -89,10 +90,15 @@ func runServer(args []string) error {
 	serviceAddr := net.JoinHostPort(s.Host, strconv.Itoa(s.ServicePort))
 	servers := []*http.Server{{
 		Addr:              serviceAddr,
-		Handler:           serviceHandler(b),
+		Handler:           serviceHandler(b, authn),
 		ReadHeaderTimeout: 5 * time.Second,
 	}}
 	log.Printf("yi %s  service http://%s  data %s", version, serviceAddr, s.Data)
+	if authn.enabled() {
+		log.Printf("auth enabled (bearer token)")
+	} else {
+		log.Printf("auth disabled (auth-token is empty)")
+	}
 	if cfg.ConfigLoaded {
 		log.Printf("config %s", cfg.ConfigPath)
 	} else {
@@ -103,7 +109,7 @@ func runServer(args []string) error {
 		frontendAddr := net.JoinHostPort(s.Host, strconv.Itoa(s.FrontendPort))
 		servers = append(servers, &http.Server{
 			Addr:              frontendAddr,
-			Handler:           frontendHandler(b),
+			Handler:           frontendHandler(b, authn),
 			ReadHeaderTimeout: 5 * time.Second,
 		})
 		log.Printf("frontend http://%s", frontendAddr)

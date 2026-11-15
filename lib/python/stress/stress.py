@@ -51,7 +51,7 @@ class ConsumerResult:
 
 def run_producer(args: argparse.Namespace, index: int, run_id: str,
                  start: threading.Event, result: ProducerResult) -> None:
-    client = Client(args.base_url, timeout=args.http_timeout)
+    client = Client(args.base_url, timeout=args.http_timeout, token=args.token)
     start.wait()
     began = time.monotonic()
 
@@ -94,7 +94,11 @@ def run_consumer(args: argparse.Namespace, index: int, run_id: str,
                  deadline: float, result: ConsumerResult) -> None:
     name = "stress-%s-c%d" % (run_id, index)
     result.name = name
-    client = Client(args.base_url, timeout=max(args.http_timeout, args.timeout + 5))
+    client = Client(
+        args.base_url,
+        timeout=max(args.http_timeout, args.timeout + 5),
+        token=args.token,
+    )
 
     consumer: Optional[Consumer] = None
     try:
@@ -156,6 +160,8 @@ def fmt_ms(seconds: float) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Yi stress test")
     parser.add_argument("--base-url", default="http://127.0.0.1:8081")
+    parser.add_argument("--token", default=os.environ.get("YI_TOKEN", ""),
+                        help="Bearer 认证令牌,默认读 YI_TOKEN")
     parser.add_argument("--producers", type=int, default=4)
     parser.add_argument("--consumers", type=int, default=3)
     parser.add_argument("--events-per-producer", type=int, default=250)
@@ -184,7 +190,7 @@ def main() -> int:
     if args.duplicate_every > 0:
         injected = ((args.events_per_producer - 1) // args.duplicate_every + 1) * args.producers
 
-    client = Client(args.base_url, timeout=args.http_timeout)
+    client = Client(args.base_url, timeout=args.http_timeout, token=args.token)
 
     # 新消费者会从游标 0 开始,因此也会读到本轮之前的历史事件。
     baseline = len(client.events(limit=0))

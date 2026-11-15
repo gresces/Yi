@@ -103,10 +103,18 @@ func TestInstallServiceWritesFiles(t *testing.T) {
 	for _, want := range []string{
 		"data = /var/lib/yi-test",
 		"service-port = 8081",
+		"auth-token = ",
 	} {
 		if !strings.Contains(string(config), want) {
 			t.Errorf("config does not contain %q:\n%s", want, config)
 		}
+	}
+	configInfo, err := os.Stat(opts.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := configInfo.Mode().Perm(); got != 0o644 {
+		t.Errorf("config mode = %o, want 644", got)
 	}
 
 	unitPath := unitFilePath(mustNormalizeInstall(t, opts))
@@ -120,6 +128,7 @@ func TestInstallServiceWritesFiles(t *testing.T) {
 
 	for _, want := range []string{
 		"wrote config",
+		"auth token:",
 		"wrote unit",
 		"skipped systemctl",
 	} {
@@ -165,6 +174,27 @@ func TestInstallServiceKeepsExistingConfig(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "keeping existing config") {
 		t.Errorf("unexpected output:\n%s", out.String())
+	}
+}
+
+func TestInstallServiceRejectsTokenWithExistingConfig(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, "yi.config")
+	if err := os.WriteFile(configPath, []byte("host = 127.0.0.1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	opts := installOptions{
+		ConfigPath: configPath,
+		UnitDir:    filepath.Join(root, "systemd"),
+		Name:       "yi-test",
+		BinPath:    filepath.Join(root, "yi"),
+		ExecPath:   filepath.Join(root, "source"),
+		AuthToken:  "0123456789abcdef",
+		NoStart:    true,
+	}
+	if err := installService(opts, &bytes.Buffer{}); err == nil {
+		t.Fatal("expected an error when -auth-token meets an existing config")
 	}
 }
 
@@ -257,6 +287,7 @@ func TestParseInstallArgs(t *testing.T) {
 		"-name", "yi-test",
 		"-bin", "/tmp/bin/yi",
 		"-exec", "/tmp/source",
+		"-auth-token", "test-token-0123456789",
 		"-no-start",
 		"-dry-run",
 	})
@@ -268,6 +299,7 @@ func TestParseInstallArgs(t *testing.T) {
 		opts.Name != "yi-test" ||
 		opts.BinPath != "/tmp/bin/yi" ||
 		opts.ExecPath != "/tmp/source" ||
+		opts.AuthToken != "test-token-0123456789" ||
 		!opts.NoStart || !opts.DryRun {
 		t.Errorf("unexpected options: %+v", opts)
 	}
@@ -289,6 +321,383 @@ func TestParseUninstallArgs(t *testing.T) {
 		opts.Name != "yi-test" ||
 		!opts.NoStart || !opts.DryRun {
 		t.Errorf("unexpected options: %+v", opts)
+	}
+}
+
+func TestParseInstallArgsUserDefaults(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	opts, err := parseInstallArgs([]string{"--user"})
+	if err != nil {
+		t.Fatalf("parseInstallArgs: %v", err)
+	}
+	if !opts.User {
+		t.Fatal("User = false, want true")
+	}
+	if want := filepath.Join(home, ".config", "yi", "yi.config"); opts.ConfigPath != want {
+		t.Errorf("ConfigPath = %q, want %q", opts.ConfigPath, want)
+	}
+	if want := filepath.Join(home, ".config", "systemd", "user"); opts.UnitDir != want {
+		t.Errorf("UnitDir = %q, want %q", opts.UnitDir, want)
+	}
+	if want := filepath.Join(home, ".local", "bin", "yi"); opts.BinPath != want {
+		t.Errorf("BinPath = %q, want %q", opts.BinPath, want)
+	}
+
+	opts = mustNormalizeInstall(t, opts)
+	if want := filepath.Join(home, ".local", "share", "yi"); opts.DataDir != want {
+		t.Errorf("DataDir = %q, want %q", opts.DataDir, want)
+	}
+}
+
+func TestParseInstallArgsUserFlagsOverrideDefaults(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	root := t.TempDir()
+	configPath := filepath.Join(root, "etc", "custom.config")
+	unitDir := filepath.Join(root, "systemd")
+	binPath := filepath.Join(root, "bin", "yi")
+
+	opts, err := parseInstallArgs([]string{
+		"--user",
+		"-config", configPath,
+		"-unit-dir", unitDir,
+		"-bin", binPath,
+		"-name", "yi-test",
+	})
+	if err != nil {
+		t.Fatalf("parseInstallArgs: %v", err)
+	}
+	if opts.ConfigPath != configPath || opts.UnitDir != unitDir || opts.BinPath != binPath {
+		t.Errorf("explicit paths did not win over user defaults: %+v", opts)
+	}
+
+	opts = mustNormalizeInstall(t, opts)
+	if want := filepath.Join(home, ".local", "share", "yi-test"); opts.DataDir != want {
+		t.Errorf("DataDir = %q, want %q", opts.DataDir, want)
+	}
+}
+
+func TestParseInstallArgsSystemDefaults(t *testing.T) {
+	opts, err := parseInstallArgs(nil)
+	if err != nil {
+		t.Fatalf("parseInstallArgs: %v", err)
+	}
+	if opts.User {
+		t.Fatal("User = true, want false")
+	}
+
+	opts = mustNormalizeInstall(t, opts)
+	if opts.ConfigPath != "/etc/yi/yi.config" {
+		t.Errorf("ConfigPath = %q", opts.ConfigPath)
+	}
+	if opts.UnitDir != "/etc/systemd/system" {
+		t.Errorf("UnitDir = %q", opts.UnitDir)
+	}
+	if opts.BinPath != "/usr/local/bin/yi" {
+		t.Errorf("BinPath = %q", opts.BinPath)
+	}
+	if opts.DataDir != "/var/lib/yi" {
+		t.Errorf("DataDir = %q", opts.DataDir)
+	}
+}
+
+func TestRenderUserServiceUnit(t *testing.T) {
+	opts := installOptions{
+		User:       true,
+		Name:       "yi",
+		BinPath:    "/home/test/.local/bin/yi",
+		ConfigPath: "/home/test/.config/yi/yi.config",
+		DataDir:    "/home/test/.local/share/yi",
+	}
+
+	unit := renderServiceUnit(opts)
+	for _, want := range []string{
+		"Type=simple",
+		"ExecStart=/home/test/.local/bin/yi -config /home/test/.config/yi/yi.config",
+		"WorkingDirectory=/home/test/.local/share/yi",
+		"Restart=on-failure",
+		"RestartSec=2",
+		"LimitNOFILE=65536",
+		"UMask=0077",
+		"NoNewPrivileges=yes",
+		"PrivateTmp=yes",
+		"WantedBy=default.target",
+	} {
+		if !strings.Contains(unit, want) {
+			t.Errorf("user unit does not contain %q:\n%s", want, unit)
+		}
+	}
+	for _, forbidden := range []string{
+		"DynamicUser",
+		"StateDirectory",
+		"ProtectSystem",
+		"ProtectHome",
+		"ReadWritePaths",
+		"multi-user.target",
+	} {
+		if strings.Contains(unit, forbidden) {
+			t.Errorf("user unit contains system-only directive %q:\n%s", forbidden, unit)
+		}
+	}
+}
+
+func TestInstallServiceUserWritesFiles(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source-yi")
+	if err := os.WriteFile(source, []byte("binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	dataDir := filepath.Join(root, "data", "yi-test")
+	opts := installOptions{
+		User:       true,
+		ConfigPath: filepath.Join(root, "etc", "yi.config"),
+		UnitDir:    filepath.Join(root, "systemd", "user"),
+		Name:       "yi-test",
+		BinPath:    filepath.Join(root, "bin", "yi"),
+		ExecPath:   source,
+		DataDir:    dataDir,
+		NoStart:    true,
+	}
+
+	var out bytes.Buffer
+	if err := installService(opts, &out); err != nil {
+		t.Fatalf("installService: %v", err)
+	}
+
+	info, err := os.Stat(dataDir)
+	if err != nil {
+		t.Fatalf("data dir was not created: %v", err)
+	}
+	if !info.IsDir() {
+		t.Fatalf("%s is not a directory", dataDir)
+	}
+	if got := info.Mode().Perm(); got != 0o755 {
+		t.Errorf("data dir mode = %o, want 755", got)
+	}
+
+	config, err := os.ReadFile(opts.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"data = " + dataDir,
+		"service-port = 8081",
+		"auth-token = ",
+	} {
+		if !strings.Contains(string(config), want) {
+			t.Errorf("user config does not contain %q:\n%s", want, config)
+		}
+	}
+
+	unitPath := unitFilePath(mustNormalizeInstall(t, opts))
+	unit, err := os.ReadFile(unitPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(unit), "WorkingDirectory="+dataDir) {
+		t.Errorf("user unit has an unexpected WorkingDirectory:\n%s", unit)
+	}
+	if !strings.Contains(string(unit), "WantedBy=default.target") {
+		t.Errorf("user unit has an unexpected install target:\n%s", unit)
+	}
+	if strings.Contains(string(unit), "DynamicUser") || strings.Contains(string(unit), "StateDirectory") {
+		t.Errorf("user unit contains system hardening:\n%s", unit)
+	}
+
+	for _, want := range []string{
+		"wrote config",
+		"wrote unit",
+		"skipped systemctl",
+		"systemctl --user daemon-reload",
+		"systemctl --user enable --now yi-test",
+	} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("output does not contain %q:\n%s", want, out.String())
+		}
+	}
+}
+
+func TestInstallServiceUserDryRunShowsUserCommands(t *testing.T) {
+	root := t.TempDir()
+	opts := installOptions{
+		User:       true,
+		ConfigPath: filepath.Join(root, "etc", "yi.config"),
+		UnitDir:    filepath.Join(root, "systemd", "user"),
+		Name:       "yi-test",
+		BinPath:    filepath.Join(root, "bin", "yi"),
+		ExecPath:   filepath.Join(root, "source-yi"),
+		DataDir:    filepath.Join(root, "data", "yi-test"),
+		DryRun:     true,
+	}
+
+	var out bytes.Buffer
+	if err := installService(opts, &out); err != nil {
+		t.Fatalf("installService: %v", err)
+	}
+
+	if _, err := os.Stat(opts.ConfigPath); !os.IsNotExist(err) {
+		t.Errorf("dry-run wrote config: %v", err)
+	}
+	if _, err := os.Stat(opts.DataDir); !os.IsNotExist(err) {
+		t.Errorf("dry-run created data dir: %v", err)
+	}
+	for _, want := range []string{
+		"# config:",
+		"# unit:",
+		"# would run: systemctl --user daemon-reload",
+		"# would run: systemctl --user enable yi-test",
+		"# would run: systemctl --user restart yi-test",
+		"# would run: loginctl enable-linger ",
+	} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("dry-run output does not contain %q:\n%s", want, out.String())
+		}
+	}
+}
+
+func TestUninstallServiceUser(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, ".config", "yi", "yi.config")
+	unitDir := filepath.Join(root, ".config", "systemd", "user")
+	dataDir := filepath.Join(root, ".local", "share", "yi-test")
+	unitPath := filepath.Join(unitDir, "yi-test.service")
+	for _, dir := range []string{unitDir, filepath.Dir(configPath), dataDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(unitPath, []byte("[Unit]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte("host = 127.0.0.1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	opts := uninstallOptions{
+		User:       true,
+		ConfigPath: configPath,
+		UnitDir:    unitDir,
+		Name:       "yi-test",
+		DataDir:    dataDir,
+		NoStart:    true,
+	}
+
+	var out bytes.Buffer
+	if err := uninstallService(opts, &out); err != nil {
+		t.Fatalf("uninstallService: %v", err)
+	}
+
+	if _, err := os.Stat(unitPath); !os.IsNotExist(err) {
+		t.Errorf("unit still exists: %v", err)
+	}
+	if _, err := os.Stat(configPath); err != nil {
+		t.Errorf("config was removed: %v", err)
+	}
+	if _, err := os.Stat(dataDir); err != nil {
+		t.Errorf("data was removed: %v", err)
+	}
+	for _, want := range []string{
+		"systemctl --user daemon-reload",
+		"config kept at " + configPath,
+		"data kept at " + dataDir,
+	} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("output does not contain %q:\n%s", want, out.String())
+		}
+	}
+}
+
+func TestUninstallServiceUserDryRunShowsUserCommands(t *testing.T) {
+	root := t.TempDir()
+	unitDir := filepath.Join(root, "systemd", "user")
+	unitPath := filepath.Join(unitDir, "yi-test.service")
+	if err := os.MkdirAll(unitDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(unitPath, []byte("[Unit]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	opts := uninstallOptions{
+		User:       true,
+		ConfigPath: filepath.Join(root, ".config", "yi", "yi.config"),
+		UnitDir:    unitDir,
+		Name:       "yi-test",
+		DataDir:    filepath.Join(root, ".local", "share", "yi-test"),
+		DryRun:     true,
+	}
+
+	var out bytes.Buffer
+	if err := uninstallService(opts, &out); err != nil {
+		t.Fatalf("uninstallService: %v", err)
+	}
+
+	if _, err := os.Stat(unitPath); err != nil {
+		t.Errorf("dry-run removed the unit: %v", err)
+	}
+	for _, want := range []string{
+		"would run: systemctl --user disable --now yi-test",
+		"would run: systemctl --user daemon-reload",
+		opts.DataDir,
+	} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("dry-run output does not contain %q:\n%s", want, out.String())
+		}
+	}
+}
+
+func TestParseUninstallArgsUserDefaults(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	opts, err := parseUninstallArgs([]string{"--user"})
+	if err != nil {
+		t.Fatalf("parseUninstallArgs: %v", err)
+	}
+	if !opts.User {
+		t.Fatal("User = false, want true")
+	}
+	if want := filepath.Join(home, ".config", "yi", "yi.config"); opts.ConfigPath != want {
+		t.Errorf("ConfigPath = %q, want %q", opts.ConfigPath, want)
+	}
+	if want := filepath.Join(home, ".config", "systemd", "user"); opts.UnitDir != want {
+		t.Errorf("UnitDir = %q, want %q", opts.UnitDir, want)
+	}
+	if err := opts.normalize(); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if want := filepath.Join(home, ".local", "share", "yi"); opts.DataDir != want {
+		t.Errorf("DataDir = %q, want %q", opts.DataDir, want)
+	}
+}
+
+func TestParseUninstallArgsUserFlagsOverrideDefaults(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	root := t.TempDir()
+	configPath := filepath.Join(root, "etc", "custom.config")
+	unitDir := filepath.Join(root, "systemd", "user")
+
+	opts, err := parseUninstallArgs([]string{
+		"--user",
+		"-config", configPath,
+		"-unit-dir", unitDir,
+		"-name", "yi-test",
+	})
+	if err != nil {
+		t.Fatalf("parseUninstallArgs: %v", err)
+	}
+	if opts.ConfigPath != configPath || opts.UnitDir != unitDir {
+		t.Errorf("explicit paths did not win over user defaults: %+v", opts)
+	}
+	if err := opts.normalize(); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if want := filepath.Join(home, ".local", "share", "yi-test"); opts.DataDir != want {
+		t.Errorf("DataDir = %q, want %q", opts.DataDir, want)
 	}
 }
 

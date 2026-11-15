@@ -442,6 +442,103 @@ func TestMultiTypeMatchingAndPending(t *testing.T) {
 	}
 }
 
+func TestRegexSubscriptionMatching(t *testing.T) {
+	b := New()
+	defer b.Close()
+
+	c, err := b.SubscribePatterns("regex", nil, []string{`^mail\.`, `^note$`, `^note$`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	if got := c.Patterns(); len(got) != 2 || got[0] != "^mail\\." || got[1] != "^note$" {
+		t.Fatalf("patterns = %#v", got)
+	}
+
+	mail := eventOf("mail", "mail.received")
+	note := eventOf("note", "note")
+	other := eventOf("other", TypeRawCaptured)
+	for _, e := range []Event{mail, note, other} {
+		res := mustPublish(t, b, e)
+		want := 0
+		if e.Types[0] == "mail.received" || e.Types[0] == "note" {
+			want = 1
+		}
+		if res.Matched != want {
+			t.Fatalf("%s matched = %d, want %d", e.ID, res.Matched, want)
+		}
+	}
+
+	if got := c.Stats().Pending; got != 2 {
+		t.Fatalf("pending = %d, want 2", got)
+	}
+	if got := c.Stats().Patterns; len(got) != 2 {
+		t.Fatalf("stats patterns = %#v", got)
+	}
+
+	for _, want := range []string{"mail", "note"} {
+		m := mustNext(t, c)
+		if m.Event.ID != want {
+			t.Fatalf("next = %s, want %s", m.Event.ID, want)
+		}
+		if err := m.Ack(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := c.Stats().Pending; got != 0 {
+		t.Fatalf("pending after ack = %d", got)
+	}
+}
+
+func TestRegexAndExactSubscriptionUnion(t *testing.T) {
+	b := New()
+	defer b.Close()
+
+	c, err := b.SubscribePatterns("mixed", []EventType{TypeRawCaptured}, []string{`^note$`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	multi := event("multi")
+	multi.Types = []EventType{TypeRawCaptured, "note"}
+	if res := mustPublish(t, b, multi); res.Matched != 1 {
+		t.Fatalf("matched = %d, want 1", res.Matched)
+	}
+	if got := c.Stats().Pending; got != 1 {
+		t.Fatalf("multi-type event must count once, pending = %d", got)
+	}
+	mustNext(t, c).Ack()
+
+	if res := mustPublish(t, b, eventOf("note", "note")); res.Matched != 1 {
+		t.Fatalf("pattern match = %d, want 1", res.Matched)
+	}
+	mustNext(t, c).Ack()
+
+	if res := mustPublish(t, b, eventOf("other", "other.type")); res.Matched != 0 {
+		t.Fatalf("non-match = %d, want 0", res.Matched)
+	}
+}
+
+func TestInvalidRegexSubscription(t *testing.T) {
+	b := New()
+	defer b.Close()
+
+	for _, patterns := range [][]string{
+		{`(`},
+		{`   `},
+		{""},
+	} {
+		if _, err := b.SubscribePatterns("bad", nil, patterns); err == nil {
+			t.Fatalf("patterns %#v should be rejected", patterns)
+		}
+	}
+	if _, err := b.SubscribePatterns("empty", nil, nil); err == nil {
+		t.Fatal("empty subscription should be rejected")
+	}
+}
+
 func TestMetrics(t *testing.T) {
 	b := New()
 	defer b.Close()

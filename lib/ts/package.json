@@ -1,6 +1,6 @@
 {
   "name": "yi-client",
-  "version": "0.1.1",
+  "version": "0.1.5",
   "description": "Zero-dependency TypeScript client for the Yi event service",
   "type": "module",
   "main": "./yi.ts",

@@ -23,10 +23,14 @@ class ConsumerTests(unittest.TestCase):
         return self.server.state.requests[-1]
 
     def make_consumer(
-        self, types=("raw.captured",), timeout: float = 0.05
+        self, types=("raw.captured",), patterns=(), timeout: float = 0.05
     ) -> Consumer:
         return Consumer(
-            self.client, "worker", list(types), timeout=timeout
+            self.client,
+            "worker",
+            list(types),
+            patterns=patterns,
+            timeout=timeout,
         )
 
     def test_constructor_registers_immediately(self) -> None:
@@ -39,6 +43,48 @@ class ConsumerTests(unittest.TestCase):
         )
         self.assertEqual(self.last_request["status"], 201)
         consumer.close()
+
+    def test_constructor_registers_patterns(self) -> None:
+        consumer = Consumer(
+            self.client,
+            "worker",
+            ["raw.captured"],
+            patterns=[r"^mail\.", r"^note$"],
+            timeout=0.05,
+        )
+        self.assertEqual(
+            self.last_request["body"],
+            {
+                "types": ["raw.captured"],
+                "patterns": [r"^mail\.", r"^note$"],
+            },
+        )
+        self.assertEqual(consumer.patterns, (r"^mail\.", r"^note$"))
+        consumer.close()
+
+    def test_patterns_only_consumer_delivers_matching_events(self) -> None:
+        consumer = Consumer(
+            self.client, "worker", [], patterns=[r"^note\."], timeout=0.05
+        )
+        self.assertEqual(
+            self.last_request["body"],
+            {"types": [], "patterns": [r"^note\."]},
+        )
+
+        ignored = Event.new("phone", types=["mail.received"])
+        matching = Event.new("phone", types=["note.created"])
+        self.client.publish(ignored)
+        self.client.publish(matching)
+
+        message = consumer.next()
+        self.assertIsNotNone(message)
+        self.assertEqual(message.event.id, matching.id)
+        message.ack()
+
+        stats = self.client.stats()[0]
+        self.assertEqual(stats.types, [])
+        self.assertEqual(stats.patterns, (r"^note\.",))
+        self.assertEqual(stats.delivered, 1)
 
     def test_constructor_propagates_conflict(self) -> None:
         self.make_consumer()

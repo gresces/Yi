@@ -5,6 +5,7 @@
 - 使用标准 `fetch`,可运行在浏览器、Node 18+、Deno、Bun。
 - 同时支持生产者、拉取式消费者和查询/管理接口。
 - TypeScript 类型完整,`fetch` 可注入(便于测试、代理和自定义 agent)。
+- 支持可选的 Bearer token 认证。
 - 没有第三方运行时依赖。
 
 Node 23.6+ 可以直接执行 `.ts` 文件(type stripping);Node 22.6–23.5 需要加
@@ -79,6 +80,34 @@ if (message !== null) {
 长轮询默认 25 秒,服务端会把等待时间限制在 60 秒以内。未确认之前重复 `next()`
 返回同一条事件,所以重试就是“不 ack 再取”。
 
+### 正则订阅
+
+`types` 是精确匹配;需要按模式订阅时,在 `ConsumerOptions.patterns` 中传入
+Go RE2 正则。两者按并集匹配,任意一个命中都会投递:
+
+```ts
+const consumer = await Consumer.open(client, "mail-notes", ["raw.captured"], {
+  patterns: ["^mail\\.", "^note$"],
+});
+```
+
+也可以只按模式订阅,此时 `types` 传空数组:
+
+```ts
+const mailOnly = await Consumer.open(client, "mail-only", [], {
+  patterns: ["^mail\\."],
+});
+```
+
+- 正则按事件类型逐个匹配;默认**非锚定**(服务端使用 Go 的 `MatchString`),
+  需要整体匹配时自行加 `^`/`$`。
+- `types` 和 `patterns` 至少有一个非空;只传模式时 `types` 传 `[]`。
+- 服务端会 trim、排序、去重;非法或空模式返回 HTTP 400。
+- Go RE2 不支持反向引用和环视(lookaround)。
+- `client.register(name, types, patterns)` 的第三个参数同样可选;
+  `client.stats()` / `consumer.stats()` 返回的 `patterns` 只在服务端保存了
+  模式时出现。
+
 ## 查询与管理
 
 ```ts
@@ -95,8 +124,27 @@ const own = await consumer.stats();        // 当前消费者
 const failures = await client.failures();
 
 await client.register("debug", ["note"]);
+await client.register("mail-debug", [], ["^mail\\."]);
 await client.deregister("debug");
 ```
+
+## 认证
+
+服务端配置了 `auth-token` 后,所有服务端口请求都必须带
+`Authorization: Bearer <token>`。默认不发送认证头;在 `ClientOptions` 中传入
+`token` 即可:
+
+```ts
+const client = new Client("http://127.0.0.1:8081", {
+  token: process.env.YI_TOKEN,
+});
+
+await client.capture("带认证的一句");
+```
+
+`token` 对 health、发布、查询、消费者注册/长轮询/ack/nack 等所有请求生效,
+包括 `Consumer` 内部发起的请求。服务端未配置 token 时省略该选项,行为与之前
+完全一致。
 
 ## 错误
 
@@ -139,7 +187,11 @@ node --test lib/ts/tests/unit.test.mjs
 # 需要先启动 Yi 服务
 YI_BASE_URL=http://127.0.0.1:8081 \
   node --test lib/ts/tests/e2e.test.mjs
+
+# 服务端启用 auth-token 时同时提供 token
+YI_BASE_URL=http://127.0.0.1:8081 YI_TOKEN=secret \
+  node --test lib/ts/tests/e2e.test.mjs
 ```
 
-单元测试注入假的 `fetch`,覆盖请求路径、超时、409、错误响应和异步迭代。
-端到端测试使用唯一类型和消费者名,可以跑在已有数据的数据库上。
+单元测试注入假的 `fetch`,覆盖请求路径、超时、409、错误响应、异步迭代以及
+认证头;端到端测试使用唯一类型和消费者名,可以跑在已有数据的数据库上。
