@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"yi/src/bus"
@@ -45,7 +46,8 @@ func serviceHandler(b *bus.Bus) http.Handler {
 		if limit <= 0 {
 			limit = 1 << 30
 		}
-		events, _ := b.Page(limit, queryInt(r, "offset", 0), "")
+		typ := bus.EventType(strings.TrimSpace(r.URL.Query().Get("type")))
+		events, _ := b.Page(limit, queryInt(r, "offset", 0), typ)
 		writeJSON(w, http.StatusOK, events)
 	})
 

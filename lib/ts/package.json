@@ -1,0 +1,30 @@
+{
+  "name": "yi-client",
+  "version": "0.1.1",
+  "description": "Zero-dependency TypeScript client for the Yi event service",
+  "type": "module",
+  "main": "./yi.ts",
+  "types": "./yi.ts",
+  "exports": {
+    ".": {
+      "types": "./yi.ts",
+      "import": "./yi.ts",
+      "default": "./yi.ts"
+    }
+  },
+  "files": [
+    "yi.ts",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=23.6"
+  },
+  "scripts": {
+    "test": "node --test tests/unit.test.mjs",
+    "test:e2e": "node --test tests/e2e.test.mjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0"
+  }
+}
