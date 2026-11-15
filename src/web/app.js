@@ -13,10 +13,20 @@
   var FAILURE_PAGE_SIZE = 50;
   var NEW_DATA_DEBOUNCE_MS = 400;
 
+  var COLUMN_WIDTH_KEY = 'yi.events.columnWidths';
+  var COLUMN_DEFAULTS = { type: 136, source: 118, time: 192 };
+  var COLUMN_MIN = { type: 96, source: 88, time: 184 };
+  var COLUMN_MAX = { type: 320, source: 280, time: 360 };
+  var CONTENT_MIN_WIDTH = 160;
+  var SELECT_COL_WIDTH = 44;
+  var ACTIONS_COL_WIDTH = 44;
+  var MAX_DELETE_BATCH = 1000;
+
   var REL_TIME_TICK_MS = 30 * 1000;
   var PRODUCER_LIMIT = 6;
   var PRODUCER_ACTIVE_MS = 2 * 60 * 1000;
   var CONSUMER_STALE_MS = 5 * 60 * 1000;
+  var STREAM_AUTH_PROBE_MS = 1200;
 
   var isMac = /Mac|iPhone|iPad|iPod/i.test(
     (navigator.platform || '') + ' ' + (navigator.userAgent || '')
@@ -36,6 +46,19 @@
   var state = {
     view: 'overview',
 
+    /* 认证 */
+    auth: {
+      authenticated: false,
+      authEnabled: false,
+      loginBusy: false,
+      logoutBusy: false,
+      generation: 0
+    },
+    dashboardStarted: false,
+    streamSource: null,
+    streamAuthProbeTimer: null,
+    streamAuthProbeBusy: false,
+
     /* 快照 */
     events: [],
     typeCounts: [],
@@ -49,6 +72,8 @@
     connection: 'connecting',
     consumerKey: '',
     producerKey: '',
+    selectedConsumerNames: new Set(),
+    selectedProducerSources: new Set(),
     lastSnapshotTotal: null,
 
     /* 相对时间 */
@@ -61,6 +86,9 @@
 
     /* 事件页 */
     pageSize: readStoredPageSize(),
+    columnWidths: readStoredColumnWidths(),
+    columnDrag: null,
+    selectedEventIds: new Set(), /* composite source+id keys */
     page: 1,
     selectedType: '',
     pageEvents: [],
@@ -96,18 +124,48 @@
     failurePageRenderKey: '',
     /* 第 1 页已经覆盖到的失败总数,用于判断“有新数据” */
     failureSeenTotal: null,
-    failureNewDataTimer: null
+    failureNewDataTimer: null,
+
+    /* 删除确认 */
+    confirm: null,
+    deleteBusy: false,
+
+    /* 事件详情 */
+    detail: null,
+    detailRowData: new WeakMap(),
+    detailBackdropDown: false,
+    detailStatusTimer: null
   };
 
   /* ---- 启动 ---- */
 
   function init() {
     el.skipLink = document.querySelector('.skip-link');
+    el.shell = document.querySelector('.shell');
     el.pageTitle = document.getElementById('page-title');
     el.pageSub = document.getElementById('page-sub');
     el.viewOverview = document.getElementById('view-overview');
     el.viewEvents = document.getElementById('view-events');
     el.viewFailures = document.getElementById('view-failures');
+
+    el.authScreen = document.getElementById('auth-screen');
+    el.authChecking = document.getElementById('auth-checking');
+    el.authCheckingText = document.getElementById('auth-checking-text');
+    el.authFormWrap = document.getElementById('auth-form-wrap');
+    el.loginForm = document.getElementById('login-form');
+    el.authToken = document.getElementById('auth-token');
+    el.authReveal = document.getElementById('auth-reveal');
+    el.authError = document.getElementById('auth-error');
+    el.authErrorText = document.getElementById('auth-error-text');
+    el.authSubmit = document.getElementById('auth-submit');
+    el.authSubmitLabel = document.getElementById('auth-submit-label');
+    el.logoutButton = document.getElementById('logout-button');
+    el.logoutLabel = document.getElementById('logout-label');
+    el.mobileLogout = document.getElementById('mobile-logout');
+    el.logoutAlert = document.getElementById('logout-alert');
+    el.logoutAlertText = document.getElementById('logout-alert-text');
+    el.logoutAlertRetry = document.getElementById('logout-alert-retry');
+    el.logoutAlertDismiss = document.getElementById('logout-alert-dismiss');
 
     el.captureForm = document.getElementById('capture-form');
     el.captureText = document.getElementById('capture-text');
@@ -158,6 +216,23 @@
     el.paginationPageValue = document.getElementById('pagination-page-value');
     el.eventsPrev = document.getElementById('events-prev');
     el.eventsNext = document.getElementById('events-next');
+    el.eventsSelectAll = document.getElementById('events-select-all');
+    el.eventsSelectAllMobile = document.getElementById('events-select-all-mobile');
+    el.eventsSelection = document.getElementById('events-selection');
+    el.eventsSelectionCount = document.getElementById('events-selection-count');
+    el.eventsSelectionClear = document.getElementById('events-selection-clear');
+    el.eventsBulkDelete = document.getElementById('events-bulk-delete');
+    el.eventCols = {
+      type: el.eventTable.querySelector('col[data-column="type"]'),
+      source: el.eventTable.querySelector('col[data-column="source"]'),
+      time: el.eventTable.querySelector('col[data-column="time"]')
+    };
+    el.eventResizers = {
+      type: el.eventTable.querySelector('.col-resizer[data-column="type"]'),
+      source: el.eventTable.querySelector('.col-resizer[data-column="source"]'),
+      content: el.eventTable.querySelector('.col-resizer[data-column="content"]'),
+      time: el.eventTable.querySelector('.col-resizer[data-column="time"]')
+    };
 
     el.failuresPanel = document.getElementById('failures');
     el.failuresTitle = document.getElementById('failures-title');
@@ -185,14 +260,21 @@
     el.failuresNext = document.getElementById('failures-next');
 
     el.consumersPanel = document.getElementById('consumers');
+    el.consumersTitle = document.getElementById('consumers-title');
     el.consumersCount = document.getElementById('consumers-count');
     el.consumerList = document.getElementById('consumer-list');
     el.consumersSkeleton = document.getElementById('consumers-skeleton');
     el.consumersEmpty = document.getElementById('consumers-empty');
     el.consumersEmptyTitle = document.getElementById('consumers-empty-title');
     el.consumersEmptyText = document.getElementById('consumers-empty-text');
+    el.consumersSelectAll = document.getElementById('consumers-select-all');
+    el.consumersSelection = document.getElementById('consumers-selection');
+    el.consumersSelectionCount = document.getElementById('consumers-selection-count');
+    el.consumersSelectionClear = document.getElementById('consumers-selection-clear');
+    el.consumersBulkDelete = document.getElementById('consumers-bulk-delete');
 
     el.producersPanel = document.getElementById('producers');
+    el.producersTitle = document.getElementById('producers-title');
     el.producersCount = document.getElementById('producers-count');
     el.producerList = document.getElementById('producer-list');
     el.producersSkeleton = document.getElementById('producers-skeleton');
@@ -200,23 +282,45 @@
     el.producersEmptyTitle = document.getElementById('producers-empty-title');
     el.producersEmptyText = document.getElementById('producers-empty-text');
     el.producersMore = document.getElementById('producers-more');
+    el.producersSelectAll = document.getElementById('producers-select-all');
+    el.producersSelection = document.getElementById('producers-selection');
+    el.producersSelectionCount = document.getElementById('producers-selection-count');
+    el.producersSelectionClear = document.getElementById('producers-selection-clear');
+    el.producersBulkDelete = document.getElementById('producers-bulk-delete');
+
+    el.confirmDialog = document.getElementById('confirm-dialog');
+    el.confirmTitle = document.getElementById('confirm-title');
+    el.confirmMessage = document.getElementById('confirm-message');
+    el.confirmWarning = document.getElementById('confirm-warning');
+    el.confirmError = document.getElementById('confirm-error');
+    el.confirmErrorText = document.getElementById('confirm-error-text');
+    el.confirmCancel = document.getElementById('confirm-cancel');
+    el.confirmSubmit = document.getElementById('confirm-submit');
+    el.deleteStatus = document.getElementById('delete-status');
+
+    el.eventDetailDialog = document.getElementById('event-detail-dialog');
+    el.eventDetailClose = document.getElementById('event-detail-close');
+    el.eventDetailBody = document.getElementById('event-detail-body');
+    el.eventDetailTypes = document.getElementById('event-detail-types');
+    el.eventDetailSource = document.getElementById('event-detail-source');
+    el.eventDetailId = document.getElementById('event-detail-id');
+    el.eventDetailTime = document.getElementById('event-detail-time');
+    el.eventDetailTimeRaw = document.getElementById('event-detail-time-raw');
+    el.eventDetailJson = document.getElementById('event-detail-json');
+    el.eventDetailCopy = document.getElementById('event-detail-copy');
+    el.eventDetailStatus = document.getElementById('event-detail-status');
 
     el.keyMod.textContent = isMac ? 'Cmd' : 'Ctrl';
     el.pageSize.value = String(state.pageSize);
+    applyEventColumnWidths();
 
     bindEvents();
-    initRouter();
     syncCaptureSubmit();
     autosize();
     setConnection('connecting');
     updateStreamNote();
-    startRelativeTimeTicker();
 
-    if (typeof window.EventSource === 'function') {
-      startStream();
-    } else {
-      handleUnsupportedStream();
-    }
+    bootstrapAuth();
   }
 
   function bindEvents() {
@@ -293,12 +397,619 @@
     el.failuresNewData.addEventListener('click', handleFailureNewDataClick);
     el.failuresRetry.addEventListener('click', retryFailurePageLoad);
 
+    el.eventsSelectAll.addEventListener('change', handleEventSelectAllChange);
+    el.eventsSelectAllMobile.addEventListener('change', handleEventSelectAllChange);
+    el.eventsSelectionClear.addEventListener('click', function () {
+      clearEventSelection(true);
+    });
+    el.eventsBulkDelete.addEventListener('click', openSelectedEventsDeleteDialog);
+    el.eventRows.addEventListener('change', handleEventRowSelectChange);
+    el.eventRows.addEventListener('click', handleEventRowDeleteClick);
+
+    el.consumersSelectAll.addEventListener('change', handleConsumerSelectAllChange);
+    el.consumersSelectionClear.addEventListener('click', function () {
+      clearConsumerSelection(true);
+    });
+    el.consumersBulkDelete.addEventListener('click', openSelectedConsumersDeleteDialog);
+    el.consumerList.addEventListener('change', handleConsumerSelectChange);
+    el.consumerList.addEventListener('click', handleConsumerDeleteClick);
+
+    el.producersSelectAll.addEventListener('change', handleProducerSelectAllChange);
+    el.producersSelectionClear.addEventListener('click', function () {
+      clearProducerSelection(true);
+    });
+    el.producersBulkDelete.addEventListener('click', openSelectedProducersDeleteDialog);
+    el.producerList.addEventListener('change', handleProducerSelectChange);
+    el.producerList.addEventListener('click', handleProducerDeleteClick);
+    el.producerList.addEventListener('click', handleProducerHideClick);
+
+    el.eventTable.addEventListener('pointerdown', handleColumnResizeStart);
+    el.eventTable.addEventListener('keydown', handleColumnResizeKeydown);
+    document.addEventListener('pointermove', handleColumnResizeMove);
+    document.addEventListener('pointerup', handleColumnResizeEnd);
+    document.addEventListener('pointercancel', handleColumnResizeEnd);
+
+    el.confirmCancel.addEventListener('click', function () {
+      closeConfirmDialog();
+    });
+    el.confirmSubmit.addEventListener('click', performConfirmedDelete);
+    el.confirmDialog.addEventListener('cancel', handleConfirmCancel);
+    el.confirmDialog.addEventListener('close', handleConfirmClose);
+
+    el.eventRows.addEventListener('dblclick', handleEventRowDoubleClick);
+    el.eventDetailClose.addEventListener('click', closeEventDetailDialog);
+    el.eventDetailCopy.addEventListener('click', copyEventDetailJson);
+    el.eventDetailDialog.addEventListener('pointerdown', handleEventDetailPointerDown);
+    el.eventDetailDialog.addEventListener('click', handleEventDetailClick);
+    el.eventDetailDialog.addEventListener('close', handleEventDetailClose);
+
+    el.loginForm.addEventListener('submit', function (event) {
+      event.preventDefault();
+      submitLogin();
+    });
+
+    el.authToken.addEventListener('input', handleAuthTokenInput);
+    el.authReveal.addEventListener('click', toggleTokenVisibility);
+    el.logoutButton.addEventListener('click', function () {
+      handleLogout(false);
+    });
+    el.mobileLogout.addEventListener('click', function () {
+      handleLogout(false);
+    });
+    el.logoutAlertRetry.addEventListener('click', function () {
+      handleLogout(true);
+    });
+    el.logoutAlertDismiss.addEventListener('click', handleLogoutAlertDismiss);
+    document.addEventListener('keydown', handleAuthKeydown);
+
     document.addEventListener('visibilitychange', handleVisibilityChange);
     window.addEventListener('resize', handleWindowResize);
   }
 
   function handleWindowResize() {
     autosize();
+    applyEventColumnWidths();
+  }
+
+  /* ---- 认证 ---- */
+
+  async function bootstrapAuth() {
+    showAuthChecking();
+
+    var session;
+    try {
+      session = await fetchSession();
+    } catch (error) {
+      showLoginOverlay({
+        message: sessionFailureMessage(error),
+        resetToken: true
+      });
+      return;
+    }
+
+    state.auth.authEnabled = session.authEnabled;
+
+    if (session.authenticated) {
+      enterAuthenticatedApp({ initial: true });
+      return;
+    }
+
+    state.auth.authenticated = false;
+    showLoginOverlay({ resetToken: true });
+  }
+
+  function showAuthChecking() {
+    hideLogoutAlert();
+    el.authScreen.hidden = false;
+    el.authScreen.removeAttribute('aria-hidden');
+    el.authScreen.scrollTop = 0;
+    el.authChecking.hidden = false;
+    el.authFormWrap.hidden = true;
+    el.authCheckingText.textContent = '正在确认登录状态…';
+    updateAuthChrome();
+    lockApp(true);
+    setConnection('connecting');
+    document.title = 'Yi · 登录';
+  }
+
+  function showLoginOverlay(options) {
+    var opts = options || {};
+    hideLogoutAlert();
+    el.authScreen.hidden = false;
+    el.authScreen.removeAttribute('aria-hidden');
+    el.authScreen.scrollTop = 0;
+    el.authChecking.hidden = true;
+    el.authFormWrap.hidden = false;
+    setAuthBusy(false);
+
+    if (opts.resetToken) {
+      el.authToken.value = '';
+      setTokenVisibility(false);
+    }
+
+    if (opts.message) {
+      showAuthError(opts.message, false);
+    } else {
+      clearAuthError();
+    }
+
+    updateAuthChrome();
+    focusAuthToken();
+    lockApp(true);
+    document.title = 'Yi · 登录';
+  }
+
+  function hideAuthScreen() {
+    el.authScreen.hidden = true;
+    el.authScreen.setAttribute('aria-hidden', 'true');
+    el.authFormWrap.hidden = true;
+    el.authChecking.hidden = false;
+    setAuthBusy(false);
+  }
+
+  function enterAuthenticatedApp(options) {
+    var initial = Boolean(options && options.initial);
+    var hadAuthFocus = el.authScreen.contains(document.activeElement);
+
+    state.auth.authenticated = true;
+    state.auth.generation += 1;
+
+    hideAuthScreen();
+    lockApp(false);
+    updateAuthChrome();
+    hideLogoutAlert();
+    clearAuthError();
+    updateViewChrome(state.view);
+
+    if (!initial && hadAuthFocus) {
+      focusMainHeading();
+    }
+
+    if (state.dashboardStarted) {
+      resumeDashboard();
+    } else {
+      startDashboard();
+    }
+  }
+
+  function startDashboard() {
+    if (state.dashboardStarted) {
+      resumeDashboard();
+      return;
+    }
+
+    state.dashboardStarted = true;
+
+    initRouter();
+    syncCaptureSubmit();
+    autosize();
+    setConnection('connecting');
+    updateStreamNote();
+    startRelativeTimeTicker();
+
+    if (typeof window.EventSource === 'function') {
+      startStream();
+    } else {
+      handleUnsupportedStream();
+    }
+  }
+
+  function resumeDashboard() {
+    setConnection('connecting');
+    updateStreamNote();
+    startRelativeTimeTicker();
+
+    if (typeof window.EventSource === 'function') {
+      startStream();
+    } else {
+      handleUnsupportedStream();
+    }
+
+    if (state.view === 'events') {
+      state.pageFocus = '';
+      hideInlineError();
+      loadEventsPage();
+    } else if (state.view === 'failures') {
+      state.failurePageFocus = '';
+      hideFailureInlineError();
+      loadFailuresPage();
+    }
+  }
+
+  function stopDashboard() {
+    stopStream();
+    stopRelativeTimeTicker();
+    cancelAutoRefresh();
+    cancelFailureAutoRefresh();
+    cancelPageLoad();
+    cancelFailurePageLoad();
+    clearCaptureStatus();
+    closeConfirmDialog({ restoreFocus: false });
+    clearAllSelections();
+  }
+
+  async function fetchSession() {
+    var payload = await requestJSON('/api/session', {
+      headers: { 'Accept': 'application/json' },
+      authCheck: true
+    });
+
+    if (!isRecord(payload) || typeof payload.authenticated !== 'boolean') {
+      throw invalidPayload('session');
+    }
+
+    return {
+      authenticated: payload.authenticated === true,
+      authEnabled: payload.auth_enabled === true
+    };
+  }
+
+  function handleAuthTokenInput() {
+    if (!el.authError.hidden) {
+      clearAuthError();
+    }
+  }
+
+  function toggleTokenVisibility() {
+    setTokenVisibility(el.authToken.type === 'password');
+    if (!state.auth.loginBusy) {
+      focusAuthToken();
+    }
+  }
+
+  function setTokenVisibility(revealed) {
+    el.authToken.type = revealed ? 'text' : 'password';
+    el.authReveal.setAttribute('aria-pressed', revealed ? 'true' : 'false');
+    el.authReveal.setAttribute('aria-label', revealed ? '隐藏令牌' : '显示令牌');
+    el.authReveal.setAttribute('title', revealed ? '隐藏令牌' : '显示令牌');
+  }
+
+  async function submitLogin() {
+    if (state.auth.loginBusy || state.auth.authenticated) {
+      return;
+    }
+
+    var token = el.authToken.value.trim();
+    if (!token) {
+      showAuthError('请输入访问令牌。', true);
+      focusAuthToken();
+      return;
+    }
+
+    clearAuthError();
+    setAuthBusy(true);
+
+    try {
+      await requestJSON('/api/login', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json'
+        },
+        body: JSON.stringify({ token: token }),
+        authCheck: true
+      });
+
+      setAuthBusy(false);
+      el.authToken.value = '';
+      setTokenVisibility(false);
+      state.auth.authEnabled = true;
+      enterAuthenticatedApp({ initial: false });
+    } catch (error) {
+      setAuthBusy(false);
+      showAuthError(loginFailureMessage(error), Boolean(error && error.status === 401));
+      focusAuthToken();
+    }
+  }
+
+  function setAuthBusy(busy) {
+    state.auth.loginBusy = busy;
+    el.loginForm.setAttribute('aria-busy', busy ? 'true' : 'false');
+    el.authSubmit.disabled = busy;
+    el.authSubmit.setAttribute('aria-busy', busy ? 'true' : 'false');
+    el.authSubmitLabel.textContent = busy ? '登录中…' : '登录';
+    el.authToken.readOnly = busy;
+    el.authReveal.disabled = busy;
+  }
+
+  function showAuthError(message, markInvalid) {
+    el.authErrorText.textContent = message;
+    el.authError.hidden = false;
+    if (markInvalid) {
+      el.authToken.setAttribute('aria-invalid', 'true');
+    } else {
+      el.authToken.removeAttribute('aria-invalid');
+    }
+  }
+
+  function clearAuthError() {
+    el.authError.hidden = true;
+    el.authErrorText.textContent = '';
+    el.authToken.removeAttribute('aria-invalid');
+  }
+
+  function sessionFailureMessage(error) {
+    if (error && error.timeout) {
+      return '确认登录状态超时，请检查连接后重试。';
+    }
+    if (error && error.network) {
+      return '无法连接服务，请检查连接后重试。';
+    }
+    if (error && error.status === 404) {
+      return '登录服务不可用，请稍后重试。';
+    }
+    if (error && error.status >= 500) {
+      return '服务暂时不可用，请稍后重试。';
+    }
+    return '无法确认登录状态，请重试。';
+  }
+
+  function loginFailureMessage(error) {
+    if (error && error.status === 401) {
+      return '令牌不正确，请检查后重试。';
+    }
+    if (error && error.timeout) {
+      return '登录请求超时，请重试。';
+    }
+    if (error && error.network) {
+      return '连不上服务，请检查网络后重试。';
+    }
+    if (error && error.status === 429) {
+      return '尝试次数过多，请稍后再试。';
+    }
+    if (error && error.status >= 500) {
+      return '服务暂时不可用，请稍后重试。';
+    }
+    return '登录失败，请稍后重试。';
+  }
+
+  function handleAuthKeydown(event) {
+    if (el.authScreen.hidden) {
+      return;
+    }
+
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
+
+    if (event.key !== 'Tab') {
+      return;
+    }
+
+    var focusables = authFocusables();
+    if (focusables.length === 0) {
+      event.preventDefault();
+      return;
+    }
+
+    var first = focusables[0];
+    var last = focusables[focusables.length - 1];
+    var active = document.activeElement;
+
+    if (event.shiftKey) {
+      if (active === first || !el.authScreen.contains(active)) {
+        event.preventDefault();
+        last.focus();
+      }
+      return;
+    }
+
+    if (active === last || !el.authScreen.contains(active)) {
+      event.preventDefault();
+      first.focus();
+    }
+  }
+
+  function authFocusables() {
+    var nodes = el.authScreen.querySelectorAll(
+      'button:not([disabled]), input:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])'
+    );
+    var focusables = [];
+    for (var i = 0; i < nodes.length; i += 1) {
+      if (nodes[i].getClientRects().length > 0) {
+        focusables.push(nodes[i]);
+      }
+    }
+    return focusables;
+  }
+
+  function focusAuthToken() {
+    try {
+      el.authToken.focus({ preventScroll: true });
+    } catch (error) {
+      el.authToken.focus();
+    }
+  }
+
+  function focusMainHeading() {
+    var target = el.pageTitle;
+    if (state.view === 'events' && el.eventsTitle) {
+      target = el.eventsTitle;
+    } else if (state.view === 'failures' && el.failuresTitle) {
+      target = el.failuresTitle;
+    }
+    if (!target) {
+      return;
+    }
+    try {
+      target.focus({ preventScroll: true });
+    } catch (error) {
+      target.focus();
+    }
+  }
+
+  function lockApp(locked) {
+    document.body.classList.toggle('is-auth-locked', locked);
+
+    if (el.shell) {
+      if ('inert' in el.shell) {
+        el.shell.inert = locked;
+      }
+      if (locked) {
+        el.shell.setAttribute('aria-hidden', 'true');
+      } else {
+        el.shell.removeAttribute('aria-hidden');
+      }
+    }
+
+    if (el.skipLink && 'inert' in el.skipLink) {
+      el.skipLink.inert = locked;
+    }
+  }
+
+  function updateAuthChrome() {
+    var showLogout = state.auth.authenticated && state.auth.authEnabled;
+    el.logoutButton.hidden = !showLogout;
+    el.mobileLogout.hidden = !showLogout;
+    if (!showLogout) {
+      setLogoutBusy(false);
+    }
+  }
+
+  async function handleLogout(fromAlert) {
+    if (state.auth.logoutBusy) {
+      return;
+    }
+
+    var retrying = Boolean(fromAlert) && !el.logoutAlert.hidden;
+
+    if (!retrying) {
+      hideLogoutAlert();
+    }
+
+    setLogoutBusy(true);
+    if (retrying) {
+      setLogoutAlertBusy(true);
+    }
+
+    try {
+      await requestJSON('/api/logout', {
+        method: 'POST',
+        headers: { 'Accept': 'application/json' },
+        authCheck: true,
+        requireStatus: 204
+      });
+    } catch (error) {
+      // HttpOnly 会话只能由服务端清除；失败时保持登录态，避免“假退出”。
+      if (!state.auth.authenticated) {
+        return;
+      }
+      setLogoutBusy(false);
+      showLogoutAlert(logoutFailureMessage(error));
+      focusLogoutAlertRetry();
+      return;
+    }
+
+    hideLogoutAlert();
+    state.auth.authenticated = false;
+    state.auth.generation += 1;
+    stopDashboard();
+    showLoginOverlay({ resetToken: true });
+  }
+
+  function logoutFailureMessage(error) {
+    if (error && error.timeout) {
+      return '退出登录超时，请重试。';
+    }
+    if (error && error.network) {
+      return '连不上服务，没能退出登录。请重试。';
+    }
+    if (error && error.status === 403) {
+      return '退出登录被拒绝，请重试。';
+    }
+    if (error && error.status >= 500) {
+      return '服务暂时不可用，没能退出登录。请重试。';
+    }
+    return '没能退出登录，请重试。';
+  }
+
+  function showLogoutAlert(message) {
+    el.logoutAlertText.textContent = message;
+    el.logoutAlert.hidden = false;
+    setLogoutAlertBusy(false);
+  }
+
+  function hideLogoutAlert() {
+    el.logoutAlert.hidden = true;
+    el.logoutAlertText.textContent = '';
+    setLogoutAlertBusy(false);
+  }
+
+  function setLogoutAlertBusy(busy) {
+    el.logoutAlertRetry.disabled = busy;
+    el.logoutAlertDismiss.disabled = busy;
+    el.logoutAlertRetry.textContent = busy ? '退出中…' : '重试';
+
+    if (busy) {
+      el.logoutAlertRetry.setAttribute('aria-busy', 'true');
+    } else {
+      el.logoutAlertRetry.removeAttribute('aria-busy');
+    }
+  }
+
+  function focusLogoutAlertRetry() {
+    try {
+      el.logoutAlertRetry.focus({ preventScroll: true });
+    } catch (error) {
+      el.logoutAlertRetry.focus();
+    }
+  }
+
+  function handleLogoutAlertDismiss() {
+    hideLogoutAlert();
+    focusLogoutControl();
+  }
+
+  function focusLogoutControl() {
+    var target = narrowScreen.matches ? el.mobileLogout : el.logoutButton;
+
+    if (!target || target.hidden) {
+      target = el.logoutButton.hidden ? el.mobileLogout : el.logoutButton;
+    }
+    if (!target || target.hidden) {
+      target = el.pageTitle;
+    }
+    if (!target) {
+      return;
+    }
+
+    try {
+      target.focus({ preventScroll: true });
+    } catch (error) {
+      target.focus();
+    }
+  }
+
+  function setLogoutBusy(busy) {
+    state.auth.logoutBusy = busy;
+    el.logoutButton.disabled = busy;
+    el.mobileLogout.disabled = busy;
+    el.logoutLabel.textContent = busy ? '正在退出…' : '退出登录';
+
+    if (busy) {
+      el.logoutButton.setAttribute('aria-busy', 'true');
+      el.mobileLogout.setAttribute('aria-busy', 'true');
+    } else {
+      el.logoutButton.removeAttribute('aria-busy');
+      el.mobileLogout.removeAttribute('aria-busy');
+    }
+  }
+
+  function handleUnauthorized() {
+    if (!state.auth.authenticated) {
+      return;
+    }
+
+    state.auth.authenticated = false;
+    state.auth.authEnabled = true;
+    state.auth.generation += 1;
+    stopDashboard();
+    showLoginOverlay({
+      message: '登录已过期，请重新登录。',
+      resetToken: true
+    });
   }
 
   /* ---- 视图路由 ---- */
@@ -348,12 +1059,27 @@
     el.viewEvents.hidden = view !== 'events';
     el.viewFailures.hidden = view !== 'failures';
     updateNav(view);
+
+    // 登录层打开时只记录目标视图，不加载数据、不抢登录框焦点。
+    if (!state.auth.authenticated) {
+      return changed;
+    }
+
     updateViewChrome(view);
+
+    if (view !== 'events') {
+      clearEventSelection(false);
+    }
+    if (view !== 'overview') {
+      clearConsumerSelection(false);
+      clearProducerSelection(false);
+    }
 
     if (view === 'events') {
       state.failurePageFocus = '';
       cancelFailureAutoRefresh();
       ensureEventsView();
+      applyEventColumnWidths();
     } else if (view === 'failures') {
       state.pageFocus = '';
       cancelAutoRefresh();
@@ -470,7 +1196,7 @@
       }
 
       showCaptureStatus(result && result.duplicate ? 'duplicate' : 'success');
-      if (finePointer.matches) {
+      if (state.auth.authenticated && finePointer.matches) {
         el.captureText.focus({ preventScroll: true });
       }
     } catch (error) {
@@ -478,7 +1204,7 @@
         console.warn('capture failed:', error.status || '', error.detail);
       }
       showCaptureError(captureFailureMessage(error));
-      if (finePointer.matches) {
+      if (state.auth.authenticated && finePointer.matches) {
         el.captureText.focus({ preventScroll: true });
       }
     } finally {
@@ -558,10 +1284,44 @@
   /* ---- 实时推送 ---- */
 
   function startStream() {
+    if (state.streamSource !== null || !state.auth.authenticated) {
+      return;
+    }
+
+    state.streamFailed = false;
+
     var source = new EventSource('/api/stream');
-    source.addEventListener('open', handleStreamOpen);
-    source.addEventListener('snapshot', handleSnapshot);
-    source.addEventListener('error', handleStreamError);
+    state.streamSource = source;
+
+    source.addEventListener('open', function () {
+      if (state.streamSource === source) {
+        handleStreamOpen();
+      }
+    });
+    source.addEventListener('snapshot', function (message) {
+      if (state.streamSource === source) {
+        handleSnapshot(message);
+      }
+    });
+    source.addEventListener('error', function () {
+      if (state.streamSource === source) {
+        handleStreamError();
+      }
+    });
+  }
+
+  function stopStream() {
+    var source = state.streamSource;
+    state.streamSource = null;
+
+    if (source !== null) {
+      source.close();
+    }
+
+    if (state.streamAuthProbeTimer !== null) {
+      window.clearTimeout(state.streamAuthProbeTimer);
+      state.streamAuthProbeTimer = null;
+    }
   }
 
   function handleStreamOpen() {
@@ -580,6 +1340,44 @@
       showSideWaiting();
     }
     updateStreamNote();
+    scheduleStreamAuthProbe();
+  }
+
+  function scheduleStreamAuthProbe() {
+    if (!state.auth.authenticated ||
+        !state.dashboardStarted ||
+        state.streamAuthProbeTimer !== null ||
+        state.streamAuthProbeBusy) {
+      return;
+    }
+
+    var generation = state.auth.generation;
+
+    state.streamAuthProbeTimer = window.setTimeout(async function () {
+      state.streamAuthProbeTimer = null;
+
+      if (!state.auth.authenticated ||
+          !state.dashboardStarted ||
+          state.auth.generation !== generation) {
+        return;
+      }
+
+      state.streamAuthProbeBusy = true;
+      try {
+        var session = await fetchSession();
+        if (state.auth.authenticated &&
+            state.dashboardStarted &&
+            state.auth.generation === generation &&
+            session.authEnabled &&
+            !session.authenticated) {
+          handleUnauthorized();
+        }
+      } catch (error) {
+        /* 探测失败不代表登录失效，保留 EventSource 的自动重连。 */
+      } finally {
+        state.streamAuthProbeBusy = false;
+      }
+    }, STREAM_AUTH_PROBE_MS);
   }
 
   function handleUnsupportedStream() {
@@ -663,8 +1461,11 @@
       var increased = previousTotal === null
         ? hasUnseenEvents()
         : total > previousTotal;
+      var decreased = previousTotal !== null && total < previousTotal;
 
-      if (increased &&
+      if (decreased && !state.pageLoading) {
+        scheduleEventsRefresh(0, true);
+      } else if (increased &&
           !state.pageLoading &&
           state.page === 1 &&
           !state.selectedType) {
@@ -723,6 +1524,9 @@
     el.producersPanel.setAttribute('aria-busy', 'false');
     updateProducersCount();
 
+    var shown = state.producers.slice(0, PRODUCER_LIMIT);
+    pruneProducerSelection(shown);
+
     if (state.producers.length === 0) {
       el.producerList.textContent = '';
       el.producerList.hidden = true;
@@ -732,6 +1536,7 @@
       el.producersEmptyTitle.textContent = '还没有生产者';
       el.producersEmptyText.textContent = '发布事件后，这里会显示输入来源。';
       state.producerKey = '';
+      updateProducerSelectionUi();
       return;
     }
 
@@ -743,11 +1548,11 @@
     }).join('\u0000');
 
     if (key === state.producerKey) {
+      updateProducerSelectionUi();
       return;
     }
     state.producerKey = key;
 
-    var shown = state.producers.slice(0, PRODUCER_LIMIT);
     var fragment = document.createDocumentFragment();
     shown.forEach(function (producer) {
       fragment.appendChild(createProducerRow(producer));
@@ -763,11 +1568,21 @@
       el.producersMore.textContent = '';
       el.producersMore.hidden = true;
     }
+
+    updateProducerSelectionUi();
   }
 
   function createProducerRow(producer) {
     var row = document.createElement('li');
     row.className = 'producer-row';
+
+    row.appendChild(createRowCheck(
+      'producer-select',
+      producer.source,
+      state.selectedProducerSources.has(producer.source),
+      '选择来源 ' + producer.source,
+      '该来源缺少名称，无法选择'
+    ));
 
     var active = isRecent(producer.lastAt, PRODUCER_ACTIVE_MS);
     var status = document.createElement('span');
@@ -814,7 +1629,62 @@
     time.textContent = lastText || '—';
     row.appendChild(time);
 
+    var actions = document.createElement('div');
+    actions.className = 'producer-actions';
+    actions.appendChild(createProducerHideButton(producer.source));
+    actions.appendChild(createRowDeleteButton(
+      'producer-delete',
+      producer.source,
+      '删除来源 ' + producer.source,
+      '该来源缺少名称，无法删除',
+      '删除来源 ' + producer.source + '，同时删除该来源的全部事件'
+    ));
+    row.appendChild(actions);
+
     return row;
+  }
+
+  function createProducerHideButton(source) {
+    var button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'row-delete row-hide producer-hide';
+
+    if (source) {
+      button.setAttribute('data-value', source);
+      button.setAttribute('aria-label', '仅删除来源 ' + source + '，保留其事件');
+      button.setAttribute('title', '仅删除来源 ' + source + '，保留其事件');
+    } else {
+      button.disabled = true;
+      button.setAttribute('aria-label', '该来源缺少名称，无法删除');
+      button.setAttribute('title', '该来源缺少名称，无法删除');
+    }
+
+    button.appendChild(createHideIcon());
+    return button;
+  }
+
+  function createHideIcon() {
+    var svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.setAttribute('viewBox', '0 0 20 20');
+    svg.setAttribute('aria-hidden', 'true');
+    svg.setAttribute('focusable', 'false');
+    svg.setAttribute('fill', 'none');
+    svg.setAttribute('stroke', 'currentColor');
+    svg.setAttribute('stroke-width', '1.5');
+    svg.setAttribute('stroke-linecap', 'round');
+    svg.setAttribute('stroke-linejoin', 'round');
+
+    [
+      'M2.75 10s2.5-4.25 7.25-4.25S17.25 10 17.25 10s-2.5 4.25-7.25 4.25S2.75 10 2.75 10Z',
+      'M8.15 8.15A2.5 2.5 0 0 0 10 12.5',
+      'M3.5 3.5l13 13'
+    ].forEach(function (pathData) {
+      var path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+      path.setAttribute('d', pathData);
+      svg.appendChild(path);
+    });
+
+    return svg;
   }
 
   function updateProducersCount() {
@@ -883,6 +1753,9 @@
   }
 
   function handleVisibilityChange() {
+    if (!state.dashboardStarted || !state.auth.authenticated) {
+      return;
+    }
     if (document.hidden) {
       stopRelativeTimeTicker();
       return;
@@ -925,6 +1798,44 @@
     }
   }
 
+  function readStoredColumnWidths() {
+    var widths = {
+      type: COLUMN_DEFAULTS.type,
+      source: COLUMN_DEFAULTS.source,
+      time: COLUMN_DEFAULTS.time
+    };
+
+    try {
+      var raw = window.localStorage.getItem(COLUMN_WIDTH_KEY);
+      if (raw) {
+        var data = JSON.parse(raw);
+        if (isRecord(data)) {
+          ['type', 'source', 'time'].forEach(function (key) {
+            var value = Number(data[key]);
+            if (Number.isFinite(value)) {
+              widths[key] = Math.min(
+                Math.max(Math.round(value), COLUMN_MIN[key]),
+                COLUMN_MAX[key]
+              );
+            }
+          });
+        }
+      }
+    } catch (error) {
+      /* 隐私模式下 localStorage 可能不可用 */
+    }
+
+    return widths;
+  }
+
+  function storeColumnWidths() {
+    try {
+      window.localStorage.setItem(COLUMN_WIDTH_KEY, JSON.stringify(state.columnWidths));
+    } catch (error) {
+      /* 忽略写入失败 */
+    }
+  }
+
   function pageCount(total, size) {
     var count = Number(total);
     var perPage = Number(size);
@@ -961,7 +1872,7 @@
     updateNewDataHint();
   }
 
-  function scheduleEventsRefresh(delay) {
+  function scheduleEventsRefresh(delay, force) {
     if (state.view !== 'events' || !state.pageLoaded) {
       return;
     }
@@ -975,7 +1886,7 @@
       if (state.view !== 'events' || state.pageLoading || !state.pageLoaded) {
         return;
       }
-      if (state.page !== 1 || state.selectedType) {
+      if (!force && (state.page !== 1 || state.selectedType)) {
         updateNewDataHint();
         return;
       }
@@ -1034,6 +1945,7 @@
 
     cancelAutoRefresh();
     cancelPageLoad();
+    clearEventSelection(false);
 
     state.selectedType = type;
     state.page = 1;
@@ -1052,6 +1964,7 @@
 
     cancelAutoRefresh();
     cancelPageLoad();
+    clearEventSelection(false);
 
     state.pageSize = next;
     state.page = 1;
@@ -1076,6 +1989,7 @@
     var active = document.activeElement;
     cancelAutoRefresh();
     cancelPageLoad();
+    clearEventSelection(false);
 
     state.pageFocus = active === el.eventsNext
       ? 'next'
@@ -1093,6 +2007,7 @@
 
     cancelAutoRefresh();
     cancelPageLoad();
+    clearEventSelection(false);
 
     state.page = 1;
     state.pageRetryTarget = null;
@@ -1109,6 +2024,7 @@
 
     cancelAutoRefresh();
     cancelPageLoad();
+    clearEventSelection(false);
 
     state.page = target.page;
     state.selectedType = target.type;
@@ -1352,6 +2268,10 @@
   }
 
   function showPageLoading() {
+    clearEventSelection(false);
+    el.eventsSelectAll.disabled = true;
+    el.eventsSelectAllMobile.disabled = true;
+    el.eventsSelection.hidden = true;
     el.eventsSkeleton.hidden = false;
     el.eventTable.hidden = true;
     el.eventsEmpty.hidden = true;
@@ -1373,6 +2293,10 @@
   }
 
   function showFirstLoadError() {
+    clearEventSelection(false);
+    el.eventsSelectAll.disabled = true;
+    el.eventsSelectAllMobile.disabled = true;
+    el.eventsSelection.hidden = true;
     el.eventsSkeleton.hidden = true;
     el.eventTable.hidden = true;
     el.eventsEmpty.hidden = true;
@@ -1417,6 +2341,9 @@
     updateEventsMeta();
     updatePagination();
     updateNewDataHint();
+    pruneEventSelection();
+    updateEventSelectionUi();
+    applyEventColumnWidths();
 
     if (!animate) {
       el.tableWrap.scrollTop = 0;
@@ -1511,6 +2438,29 @@
       row.className = 'is-new';
     }
 
+    var deleteId = eventDeleteId(event);
+    var rawSource = event && typeof event.source === 'string' ? event.source : '';
+    var source = rawSource || '未知';
+    var selectionKey = eventSelectionKey(event);
+
+    if (deleteId) {
+      row.setAttribute('data-event-id', deleteId);
+    }
+    if (rawSource) {
+      row.setAttribute('data-event-source', rawSource);
+    }
+
+    var selectCell = document.createElement('td');
+    selectCell.className = 'cell-select';
+    selectCell.appendChild(createRowCheck(
+      'event-row-select',
+      selectionKey,
+      selectionKey ? state.selectedEventIds.has(selectionKey) : false,
+      '选择事件 ' + deleteId + '，来源 ' + source,
+      '该事件缺少标识或来源，无法选择'
+    ));
+    row.appendChild(selectCell);
+
     var rawTypes = eventTypes(event);
     var typeCell = document.createElement('td');
     typeCell.className = 'cell-type';
@@ -1533,9 +2483,6 @@
     typeCell.appendChild(chips);
     row.appendChild(typeCell);
 
-    var source = event && typeof event.source === 'string' && event.source
-      ? event.source
-      : '未知';
     var sourceCell = document.createElement('td');
     sourceCell.className = 'cell-source';
     var sourceValue = document.createElement('span');
@@ -1563,11 +2510,25 @@
     if (rawTime) {
       time.setAttribute('datetime', rawTime);
     }
-    time.textContent = tableTime(rawTime);
+    time.textContent = completeTime(rawTime);
     time.setAttribute('title', full);
     time.setAttribute('aria-label', full);
     timeCell.appendChild(time);
     row.appendChild(timeCell);
+
+    var actionsCell = document.createElement('td');
+    actionsCell.className = 'cell-actions';
+    actionsCell.appendChild(createRowDeleteButton(
+      'event-row-delete',
+      selectionKey,
+      '删除事件 ' + deleteId + '，来源 ' + source,
+      '该事件缺少标识或来源，无法删除',
+      '删除事件'
+    ));
+    row.appendChild(actionsCell);
+
+    // 行没有可用的 id 时仍可在详情里取到刚刚渲染的这份数据。
+    state.detailRowData.set(row, event);
 
     return row;
   }
@@ -1670,6 +2631,7 @@
     el.consumersSkeleton.hidden = true;
     el.consumersPanel.setAttribute('aria-busy', 'false');
     updateConsumersCount();
+    pruneConsumerSelection();
 
     if (state.consumers.length === 0) {
       el.consumerList.textContent = '';
@@ -1678,6 +2640,7 @@
       el.consumersEmptyTitle.textContent = '还没有消费者';
       el.consumersEmptyText.textContent = '注册消费者后，这里会显示游标和投递进度。';
       state.consumerKey = '';
+      updateConsumerSelectionUi();
       return;
     }
 
@@ -1688,6 +2651,7 @@
       return [
         consumer.name,
         Array.isArray(consumer.types) ? consumer.types.join(',') : '',
+        Array.isArray(consumer.patterns) ? consumer.patterns.join(',') : '',
         consumer.cursor,
         consumer.pending,
         consumer.delivered,
@@ -1697,6 +2661,7 @@
     }).join('\u0000');
 
     if (key === state.consumerKey) {
+      updateConsumerSelectionUi();
       return;
     }
     state.consumerKey = key;
@@ -1708,19 +2673,30 @@
 
     el.consumerList.textContent = '';
     el.consumerList.appendChild(fragment);
+    updateConsumerSelectionUi();
   }
 
   function createConsumerRow(consumer) {
     var row = document.createElement('div');
     row.className = 'consumer-row';
 
+    var deleteName = consumer && typeof consumer.name === 'string' && consumer.name
+      ? consumer.name
+      : '';
+
     var head = document.createElement('div');
     head.className = 'consumer-head';
+    head.appendChild(createRowCheck(
+      'consumer-select',
+      deleteName,
+      deleteName ? state.selectedConsumerNames.has(deleteName) : false,
+      '选择消费者 ' + deleteName,
+      '该消费者缺少名称，无法选择'
+    ));
+
     var name = document.createElement('p');
     name.className = 'consumer-name';
-    var rawName = consumer && typeof consumer.name === 'string' && consumer.name
-      ? consumer.name
-      : '未命名消费者';
+    var rawName = deleteName || '未命名消费者';
     name.textContent = rawName;
     name.setAttribute('title', rawName);
     head.appendChild(name);
@@ -1747,20 +2723,41 @@
     badgeLabel.textContent = status.label;
     badge.appendChild(badgeLabel);
     head.appendChild(badge);
+    head.appendChild(createRowDeleteButton(
+      'consumer-delete',
+      deleteName,
+      '删除消费者 ' + deleteName,
+      '该消费者缺少名称，无法删除',
+      '删除消费者 ' + deleteName
+    ));
     row.appendChild(head);
 
-    if (Array.isArray(consumer.types) && consumer.types.length > 0) {
-      var types = document.createElement('div');
-      types.className = 'consumer-types';
-      consumer.types.forEach(function (type) {
+    var consumerTypes = consumer && Array.isArray(consumer.types) ? consumer.types : [];
+    var consumerPatterns = consumer && Array.isArray(consumer.patterns) ? consumer.patterns : [];
+
+    if (consumerTypes.length > 0 || consumerPatterns.length > 0) {
+      var subscriptions = document.createElement('div');
+      subscriptions.className = 'consumer-types';
+
+      consumerTypes.forEach(function (type) {
         var raw = String(type);
         var tag = document.createElement('span');
         tag.className = 'type-tag';
         tag.textContent = raw;
         tag.setAttribute('title', raw);
-        types.appendChild(tag);
+        subscriptions.appendChild(tag);
       });
-      row.appendChild(types);
+
+      consumerPatterns.forEach(function (pattern) {
+        var raw = String(pattern);
+        var tag = document.createElement('span');
+        tag.className = 'type-tag is-regex';
+        tag.textContent = 're:' + raw;
+        tag.setAttribute('title', raw);
+        subscriptions.appendChild(tag);
+      });
+
+      row.appendChild(subscriptions);
     }
 
     var last = document.createElement('p');
@@ -1837,6 +2834,1290 @@
     el.consumersCount.textContent = state.consumers.length === 0
       ? '尚未注册'
       : formatNumber(state.consumers.length) + ' 个已注册';
+  }
+
+  /* ---- 选择、删除与列宽 ---- */
+
+  function createDeleteIcon() {
+    var svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.setAttribute('viewBox', '0 0 20 20');
+    svg.setAttribute('aria-hidden', 'true');
+    svg.setAttribute('focusable', 'false');
+    svg.setAttribute('fill', 'none');
+    svg.setAttribute('stroke', 'currentColor');
+    svg.setAttribute('stroke-width', '1.5');
+    svg.setAttribute('stroke-linecap', 'round');
+    svg.setAttribute('stroke-linejoin', 'round');
+
+    [
+      'M4.5 5.75h11',
+      'M8 5.75V4.5h4v1.25',
+      'M6 5.75l.75 9h6.5L14 5.75',
+      'M8.75 8.75v3.5',
+      'M11.25 8.75v3.5'
+    ].forEach(function (pathData) {
+      var path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+      path.setAttribute('d', pathData);
+      svg.appendChild(path);
+    });
+
+    return svg;
+  }
+
+  function createRowCheck(className, value, checked, label, disabledLabel) {
+    var wrapper = document.createElement('label');
+    wrapper.className = 'row-check';
+
+    var input = document.createElement('input');
+    input.type = 'checkbox';
+    input.className = className;
+
+    if (value) {
+      input.checked = Boolean(checked);
+      input.setAttribute('data-value', value);
+      input.setAttribute('aria-label', label);
+    } else {
+      input.disabled = true;
+      input.setAttribute('aria-label', disabledLabel);
+    }
+
+    wrapper.appendChild(input);
+    return wrapper;
+  }
+
+  function createRowDeleteButton(className, value, label, disabledLabel, title) {
+    var button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'row-delete ' + className;
+
+    if (value) {
+      button.setAttribute('data-value', value);
+      button.setAttribute('aria-label', label);
+      button.setAttribute('title', title || label);
+    } else {
+      button.disabled = true;
+      button.setAttribute('aria-label', disabledLabel);
+      button.setAttribute('title', disabledLabel);
+    }
+
+    button.appendChild(createDeleteIcon());
+    return button;
+  }
+
+  function eventDeleteId(event) {
+    if (!event || event.id === undefined || event.id === null) {
+      return '';
+    }
+    var id = String(event.id);
+    return id;
+  }
+
+  function eventDeleteRef(event) {
+    var id = eventDeleteId(event);
+    var source = event && typeof event.source === 'string' ? event.source : '';
+    if (!id || !source) {
+      return null;
+    }
+    return { id: id, source: source };
+  }
+
+  function eventSelectionKey(event) {
+    var id = eventDeleteId(event);
+    var source = event && typeof event.source === 'string' ? event.source : '';
+    if (!id || !source) {
+      return '';
+    }
+    // Event IDs are scoped by source; keep both in the selection key.
+    return JSON.stringify([source, id]);
+  }
+
+  function consumerDeleteName(consumer) {
+    return consumer && typeof consumer.name === 'string' ? consumer.name : '';
+  }
+
+  function updateEventSelectionUi() {
+    var validKeys = [];
+    state.pageEvents.forEach(function (event) {
+      var key = eventSelectionKey(event);
+      if (key) {
+        validKeys.push(key);
+      }
+    });
+
+    var selectedCount = 0;
+    validKeys.forEach(function (key) {
+      if (state.selectedEventIds.has(key)) {
+        selectedCount += 1;
+      }
+    });
+
+    var boxes = el.eventRows.querySelectorAll('.event-row-select');
+    for (var i = 0; i < boxes.length; i += 1) {
+      var key = boxes[i].getAttribute('data-value') || '';
+      boxes[i].checked = Boolean(key && state.selectedEventIds.has(key));
+    }
+
+    var allSelected = validKeys.length > 0 && selectedCount === validKeys.length;
+    var partiallySelected = selectedCount > 0 && selectedCount < validKeys.length;
+
+    [el.eventsSelectAll, el.eventsSelectAllMobile].forEach(function (input) {
+      if (!input) {
+        return;
+      }
+      input.checked = allSelected;
+      input.indeterminate = partiallySelected;
+      input.disabled = validKeys.length === 0;
+    });
+
+    el.eventsSelection.hidden = selectedCount === 0;
+    el.eventsSelectionCount.textContent = '已选 ' + formatNumber(selectedCount) + ' 条';
+  }
+
+  function pruneEventSelection() {
+    var validKeys = new Set();
+    state.pageEvents.forEach(function (event) {
+      var key = eventSelectionKey(event);
+      if (key) {
+        validKeys.add(key);
+      }
+    });
+
+    state.selectedEventIds.forEach(function (key) {
+      if (!validKeys.has(key)) {
+        state.selectedEventIds.delete(key);
+      }
+    });
+  }
+
+  function clearEventSelection(restoreFocus) {
+    var hadSelection = state.selectedEventIds.size > 0;
+    state.selectedEventIds.clear();
+    updateEventSelectionUi();
+    if (hadSelection && restoreFocus) {
+      focusSelectionFallback('events');
+    }
+  }
+
+  function handleEventSelectAllChange(event) {
+    var checked = Boolean(event.target.checked);
+    var validKeys = [];
+    state.pageEvents.forEach(function (item) {
+      var key = eventSelectionKey(item);
+      if (key) {
+        validKeys.push(key);
+      }
+    });
+
+    validKeys.forEach(function (key) {
+      if (checked) {
+        state.selectedEventIds.add(key);
+      } else {
+        state.selectedEventIds.delete(key);
+      }
+    });
+    updateEventSelectionUi();
+  }
+
+  function handleEventRowSelectChange(event) {
+    if (!(event.target instanceof Element)) {
+      return;
+    }
+    var input = event.target.closest('.event-row-select');
+    if (!input || !el.eventRows.contains(input)) {
+      return;
+    }
+    var key = input.getAttribute('data-value');
+    if (!key) {
+      return;
+    }
+    if (input.checked) {
+      state.selectedEventIds.add(key);
+    } else {
+      state.selectedEventIds.delete(key);
+    }
+    updateEventSelectionUi();
+  }
+
+  function selectedPageEventRefs() {
+    var refs = [];
+    state.pageEvents.forEach(function (event) {
+      var ref = eventDeleteRef(event);
+      var key = eventSelectionKey(event);
+      if (ref && key && state.selectedEventIds.has(key)) {
+        refs.push(ref);
+      }
+    });
+    return refs;
+  }
+
+  function openSelectedEventsDeleteDialog() {
+    var refs = selectedPageEventRefs();
+    if (refs.length === 0) {
+      updateEventSelectionUi();
+      return;
+    }
+    openDeleteConfirm('events', refs, el.eventsTitle);
+  }
+
+  function handleEventRowDeleteClick(event) {
+    if (!(event.target instanceof Element)) {
+      return;
+    }
+    var button = event.target.closest('.event-row-delete');
+    if (!button || !el.eventRows.contains(button)) {
+      return;
+    }
+    var key = button.getAttribute('data-value');
+    if (!key) {
+      return;
+    }
+
+    var ref = null;
+    state.pageEvents.forEach(function (item) {
+      var candidate = eventDeleteRef(item);
+      if (candidate && eventSelectionKey(candidate) === key) {
+        ref = candidate;
+      }
+    });
+    if (!ref) {
+      pruneEventSelection();
+      updateEventSelectionUi();
+      return;
+    }
+    openDeleteConfirm('events', [ref], el.eventsTitle);
+  }
+
+  function updateConsumerSelectionUi() {
+    var validNames = [];
+    state.consumers.forEach(function (consumer) {
+      var name = consumerDeleteName(consumer);
+      if (name) {
+        validNames.push(name);
+      }
+    });
+
+    var selectedCount = 0;
+    validNames.forEach(function (name) {
+      if (state.selectedConsumerNames.has(name)) {
+        selectedCount += 1;
+      }
+    });
+
+    var boxes = el.consumerList.querySelectorAll('.consumer-select');
+    for (var i = 0; i < boxes.length; i += 1) {
+      var name = boxes[i].getAttribute('data-value') || '';
+      boxes[i].checked = Boolean(name && state.selectedConsumerNames.has(name));
+    }
+
+    el.consumersSelectAll.checked = validNames.length > 0 && selectedCount === validNames.length;
+    el.consumersSelectAll.indeterminate = selectedCount > 0 && selectedCount < validNames.length;
+    el.consumersSelectAll.disabled = validNames.length === 0;
+    el.consumersSelection.hidden = selectedCount === 0;
+    el.consumersSelectionCount.textContent = '已选 ' + formatNumber(selectedCount) + ' 个消费者';
+  }
+
+  function pruneConsumerSelection() {
+    var validNames = new Set();
+    state.consumers.forEach(function (consumer) {
+      var name = consumerDeleteName(consumer);
+      if (name) {
+        validNames.add(name);
+      }
+    });
+    state.selectedConsumerNames.forEach(function (name) {
+      if (!validNames.has(name)) {
+        state.selectedConsumerNames.delete(name);
+      }
+    });
+  }
+
+  function clearConsumerSelection(restoreFocus) {
+    var hadSelection = state.selectedConsumerNames.size > 0;
+    state.selectedConsumerNames.clear();
+    updateConsumerSelectionUi();
+    if (hadSelection && restoreFocus) {
+      focusSelectionFallback('consumers');
+    }
+  }
+
+  function handleConsumerSelectAllChange(event) {
+    var checked = Boolean(event.target.checked);
+    state.consumers.forEach(function (consumer) {
+      var name = consumerDeleteName(consumer);
+      if (!name) {
+        return;
+      }
+      if (checked) {
+        state.selectedConsumerNames.add(name);
+      } else {
+        state.selectedConsumerNames.delete(name);
+      }
+    });
+    updateConsumerSelectionUi();
+  }
+
+  function handleConsumerSelectChange(event) {
+    if (!(event.target instanceof Element)) {
+      return;
+    }
+    var input = event.target.closest('.consumer-select');
+    if (!input || !el.consumerList.contains(input)) {
+      return;
+    }
+    var name = input.getAttribute('data-value');
+    if (!name) {
+      return;
+    }
+    if (input.checked) {
+      state.selectedConsumerNames.add(name);
+    } else {
+      state.selectedConsumerNames.delete(name);
+    }
+    updateConsumerSelectionUi();
+  }
+
+  function openSelectedConsumersDeleteDialog() {
+    var names = [];
+    state.consumers.forEach(function (consumer) {
+      var name = consumerDeleteName(consumer);
+      if (name && state.selectedConsumerNames.has(name)) {
+        names.push(name);
+      }
+    });
+    if (names.length === 0) {
+      updateConsumerSelectionUi();
+      return;
+    }
+    openDeleteConfirm('consumers', names, el.consumersTitle);
+  }
+
+  function handleConsumerDeleteClick(event) {
+    if (!(event.target instanceof Element)) {
+      return;
+    }
+    var button = event.target.closest('.consumer-delete');
+    if (!button || !el.consumerList.contains(button)) {
+      return;
+    }
+    var name = button.getAttribute('data-value');
+    if (!name) {
+      return;
+    }
+    openDeleteConfirm('consumers', [name], el.consumersTitle);
+  }
+
+  function visibleProducers() {
+    return state.producers.slice(0, PRODUCER_LIMIT);
+  }
+
+  function updateProducerSelectionUi() {
+    var validSources = [];
+    visibleProducers().forEach(function (producer) {
+      if (producer.source) {
+        validSources.push(producer.source);
+      }
+    });
+
+    var selectedCount = 0;
+    validSources.forEach(function (source) {
+      if (state.selectedProducerSources.has(source)) {
+        selectedCount += 1;
+      }
+    });
+
+    var boxes = el.producerList.querySelectorAll('.producer-select');
+    for (var i = 0; i < boxes.length; i += 1) {
+      var source = boxes[i].getAttribute('data-value') || '';
+      boxes[i].checked = Boolean(source && state.selectedProducerSources.has(source));
+    }
+
+    el.producersSelectAll.checked = validSources.length > 0 && selectedCount === validSources.length;
+    el.producersSelectAll.indeterminate = selectedCount > 0 && selectedCount < validSources.length;
+    el.producersSelectAll.disabled = validSources.length === 0;
+    el.producersSelection.hidden = selectedCount === 0;
+    el.producersSelectionCount.textContent = '已选 ' + formatNumber(selectedCount) + ' 个来源';
+  }
+
+  function pruneProducerSelection(shown) {
+    var validSources = new Set();
+    (shown || []).forEach(function (producer) {
+      if (producer.source) {
+        validSources.add(producer.source);
+      }
+    });
+    state.selectedProducerSources.forEach(function (source) {
+      if (!validSources.has(source)) {
+        state.selectedProducerSources.delete(source);
+      }
+    });
+  }
+
+  function clearProducerSelection(restoreFocus) {
+    var hadSelection = state.selectedProducerSources.size > 0;
+    state.selectedProducerSources.clear();
+    updateProducerSelectionUi();
+    if (hadSelection && restoreFocus) {
+      focusSelectionFallback('producers');
+    }
+  }
+
+  function handleProducerSelectAllChange(event) {
+    var checked = Boolean(event.target.checked);
+    visibleProducers().forEach(function (producer) {
+      if (!producer.source) {
+        return;
+      }
+      if (checked) {
+        state.selectedProducerSources.add(producer.source);
+      } else {
+        state.selectedProducerSources.delete(producer.source);
+      }
+    });
+    updateProducerSelectionUi();
+  }
+
+  function handleProducerSelectChange(event) {
+    if (!(event.target instanceof Element)) {
+      return;
+    }
+    var input = event.target.closest('.producer-select');
+    if (!input || !el.producerList.contains(input)) {
+      return;
+    }
+    var source = input.getAttribute('data-value');
+    if (!source) {
+      return;
+    }
+    if (input.checked) {
+      state.selectedProducerSources.add(source);
+    } else {
+      state.selectedProducerSources.delete(source);
+    }
+    updateProducerSelectionUi();
+  }
+
+  function openSelectedProducersDeleteDialog() {
+    var sources = [];
+    visibleProducers().forEach(function (producer) {
+      if (producer.source && state.selectedProducerSources.has(producer.source)) {
+        sources.push(producer.source);
+      }
+    });
+    if (sources.length === 0) {
+      updateProducerSelectionUi();
+      return;
+    }
+    openDeleteConfirm('producers', sources, el.producersTitle);
+  }
+
+  function handleProducerDeleteClick(event) {
+    if (!(event.target instanceof Element)) {
+      return;
+    }
+    var button = event.target.closest('.producer-delete');
+    if (!button || !el.producerList.contains(button)) {
+      return;
+    }
+    var source = button.getAttribute('data-value');
+    if (!source) {
+      return;
+    }
+    openDeleteConfirm('producers', [source], el.producersTitle);
+  }
+
+  function handleProducerHideClick(event) {
+    if (!(event.target instanceof Element)) {
+      return;
+    }
+    var button = event.target.closest('.producer-hide');
+    if (!button || !el.producerList.contains(button)) {
+      return;
+    }
+    var source = button.getAttribute('data-value');
+    if (!source) {
+      return;
+    }
+    openDeleteConfirm('producers-hide', [source], el.producersTitle);
+  }
+
+  function clearAllSelections() {
+    clearEventSelection(false);
+    clearConsumerSelection(false);
+    clearProducerSelection(false);
+  }
+
+  function focusSelectionFallback(kind) {
+    var target = null;
+
+    if (kind === 'events') {
+      if (isElementFocusable(el.eventsSelectAll)) {
+        target = el.eventsSelectAll;
+      } else if (isElementFocusable(el.eventsSelectAllMobile)) {
+        target = el.eventsSelectAllMobile;
+      } else {
+        target = el.eventsTitle;
+      }
+    } else if (kind === 'consumers') {
+      target = isElementFocusable(el.consumersSelectAll) ? el.consumersSelectAll : el.consumersTitle;
+    } else {
+      target = isElementFocusable(el.producersSelectAll) ? el.producersSelectAll : el.producersTitle;
+    }
+
+    focusElement(target);
+  }
+
+  function isElementFocusable(target) {
+    return Boolean(target) &&
+      target.isConnected &&
+      !target.disabled &&
+      target.getClientRects().length > 0;
+  }
+
+  function focusElement(target) {
+    if (!target) {
+      return;
+    }
+    try {
+      target.focus({ preventScroll: true });
+    } catch (error) {
+      target.focus();
+    }
+  }
+
+  /* ---- 列宽 ---- */
+
+  function applyEventColumnWidths() {
+    if (!el.eventTable) {
+      return;
+    }
+
+    ['type', 'source', 'time'].forEach(function (key) {
+      var width = state.columnWidths[key];
+      var col = el.eventCols && el.eventCols[key];
+      if (col) {
+        col.style.width = width + 'px';
+      }
+
+      var resizer = el.eventResizers && el.eventResizers[key];
+      if (resizer) {
+        resizer.setAttribute('aria-valuenow', String(width));
+        resizer.setAttribute('aria-valuemin', String(COLUMN_MIN[key]));
+        resizer.setAttribute('aria-valuemax', String(COLUMN_MAX[key]));
+        resizer.setAttribute('aria-valuetext', width + ' 像素');
+      }
+    });
+
+    var minWidth = SELECT_COL_WIDTH + ACTIONS_COL_WIDTH +
+      state.columnWidths.type + state.columnWidths.source + state.columnWidths.time +
+      CONTENT_MIN_WIDTH;
+    el.eventTable.style.minWidth = narrowScreen.matches ? '' : minWidth + 'px';
+
+    var contentResizer = el.eventResizers && el.eventResizers.content;
+    if (contentResizer) {
+      var contentHead = el.eventTable.querySelector('th[data-column="content"]');
+      var contentWidth = contentHead
+        ? Math.round(contentHead.getBoundingClientRect().width)
+        : 0;
+      var availableContent = el.tableWrap && el.tableWrap.clientWidth
+        ? el.tableWrap.clientWidth - SELECT_COL_WIDTH - ACTIONS_COL_WIDTH -
+          state.columnWidths.type - state.columnWidths.source - COLUMN_MIN.time
+        : contentWidth;
+      var maxContent = Math.max(CONTENT_MIN_WIDTH, availableContent);
+
+      contentResizer.setAttribute('aria-valuenow', String(contentWidth));
+      contentResizer.setAttribute('aria-valuemin', String(CONTENT_MIN_WIDTH));
+      contentResizer.setAttribute('aria-valuemax', String(Math.round(maxContent)));
+      contentResizer.setAttribute('aria-valuetext', contentWidth + ' 像素');
+    }
+  }
+
+  function handleColumnResizeStart(event) {
+    if (!(event.target instanceof Element)) {
+      return;
+    }
+    var resizer = event.target.closest('.col-resizer');
+    if (!resizer || !el.eventTable.contains(resizer)) {
+      return;
+    }
+    if (event.pointerType === 'mouse' && event.button !== 0) {
+      return;
+    }
+
+    var column = resizer.getAttribute('data-column');
+    var isContent = column === 'content';
+    if (!isContent && !Object.prototype.hasOwnProperty.call(COLUMN_DEFAULTS, column)) {
+      return;
+    }
+
+    event.preventDefault();
+    state.columnDrag = {
+      column: column,
+      isContent: isContent,
+      startX: event.clientX,
+      startWidth: isContent ? state.columnWidths.time : state.columnWidths[column],
+      pointerId: event.pointerId,
+      resizer: resizer
+    };
+    document.body.classList.add('is-col-resizing');
+
+    try {
+      resizer.setPointerCapture(event.pointerId);
+    } catch (error) {
+      /* 某些浏览器不支持 pointer capture，document 监听仍可工作 */
+    }
+  }
+
+  function handleColumnResizeMove(event) {
+    var drag = state.columnDrag;
+    if (!drag || event.pointerId !== drag.pointerId) {
+      return;
+    }
+
+    event.preventDefault();
+    var delta = event.clientX - drag.startX;
+
+    if (drag.isContent) {
+      var timeWidth = drag.startWidth - delta;
+      state.columnWidths.time = Math.round(Math.min(
+        Math.max(timeWidth, COLUMN_MIN.time),
+        COLUMN_MAX.time
+      ));
+    } else {
+      var width = drag.startWidth + delta;
+      width = Math.min(Math.max(width, COLUMN_MIN[drag.column]), COLUMN_MAX[drag.column]);
+      state.columnWidths[drag.column] = Math.round(width);
+    }
+
+    applyEventColumnWidths();
+  }
+
+  function handleColumnResizeEnd(event) {
+    var drag = state.columnDrag;
+    if (!drag) {
+      return;
+    }
+    if (event && event.pointerId !== drag.pointerId) {
+      return;
+    }
+
+    state.columnDrag = null;
+    document.body.classList.remove('is-col-resizing');
+
+    try {
+      if (drag.resizer.hasPointerCapture(drag.pointerId)) {
+        drag.resizer.releasePointerCapture(drag.pointerId);
+      }
+    } catch (error) {
+      /* 忽略释放失败的 pointer capture */
+    }
+
+    storeColumnWidths();
+  }
+
+  function handleColumnResizeKeydown(event) {
+    if (!(event.target instanceof Element)) {
+      return;
+    }
+    var resizer = event.target.closest('.col-resizer');
+    if (!resizer || !el.eventTable.contains(resizer)) {
+      return;
+    }
+
+    var column = resizer.getAttribute('data-column');
+    var isContent = column === 'content';
+    if (!isContent && !Object.prototype.hasOwnProperty.call(COLUMN_DEFAULTS, column)) {
+      return;
+    }
+
+    var step = event.shiftKey ? 48 : 16;
+
+    if (isContent) {
+      var timeWidth = state.columnWidths.time;
+
+      if (event.key === 'ArrowLeft') {
+        timeWidth += step;
+      } else if (event.key === 'ArrowRight') {
+        timeWidth -= step;
+      } else if (event.key === 'Home') {
+        timeWidth = COLUMN_MAX.time;
+      } else if (event.key === 'End') {
+        timeWidth = COLUMN_MIN.time;
+      } else {
+        return;
+      }
+
+      event.preventDefault();
+      state.columnWidths.time = Math.min(
+        Math.max(timeWidth, COLUMN_MIN.time),
+        COLUMN_MAX.time
+      );
+      applyEventColumnWidths();
+      storeColumnWidths();
+      return;
+    }
+
+    var width = state.columnWidths[column];
+
+    if (event.key === 'ArrowLeft') {
+      width -= step;
+    } else if (event.key === 'ArrowRight') {
+      width += step;
+    } else if (event.key === 'Home') {
+      width = COLUMN_MIN[column];
+    } else if (event.key === 'End') {
+      width = COLUMN_MAX[column];
+    } else {
+      return;
+    }
+
+    event.preventDefault();
+    state.columnWidths[column] = Math.min(
+      Math.max(width, COLUMN_MIN[column]),
+      COLUMN_MAX[column]
+    );
+    applyEventColumnWidths();
+    storeColumnWidths();
+  }
+
+  /* ---- 删除确认 ---- */
+
+  function openDeleteConfirm(kind, items, fallback) {
+    if (state.confirm || el.confirmDialog.open || el.eventDetailDialog.open) {
+      return;
+    }
+
+    var content = confirmContentFor(kind, items);
+    state.confirm = {
+      kind: kind,
+      items: items.slice(),
+      returnFocus: document.activeElement,
+      fallback: fallback || el.pageTitle,
+      submitLabel: content.submitLabel || '删除',
+      busyLabel: content.busyLabel || '删除中…',
+      danger: content.danger !== false
+    };
+    state.deleteBusy = false;
+
+    el.confirmTitle.textContent = content.title;
+    el.confirmMessage.textContent = content.message;
+    el.confirmWarning.textContent = content.warning;
+    el.confirmWarning.hidden = !content.warning;
+    el.confirmSubmit.classList.toggle('button-danger', state.confirm.danger);
+    el.confirmSubmit.classList.toggle('button-primary', !state.confirm.danger);
+    clearConfirmError();
+    setConfirmBusy(false);
+    el.deleteStatus.textContent = '';
+
+    el.confirmDialog.showModal();
+    focusElement(el.confirmCancel);
+  }
+
+  function confirmContentFor(kind, items) {
+    var count = items.length;
+
+    if (kind === 'events') {
+      return {
+        title: count === 1 ? '删除事件' : '删除所选事件',
+        message: count === 1
+          ? '确定要删除这条事件吗？'
+          : '确定要删除选中的 ' + formatNumber(count) + ' 条事件吗？',
+        warning: '删除后无法恢复。'
+      };
+    }
+
+    if (kind === 'consumers') {
+      return {
+        title: count === 1 ? '删除消费者' : '删除所选消费者',
+        message: count === 1
+          ? '确定要删除消费者「' + items[0] + '」吗？'
+          : '确定要删除选中的 ' + formatNumber(count) + ' 个消费者吗？',
+        warning: '消费者会被取消注册，已有事件不会删除。'
+      };
+    }
+
+    if (kind === 'producers-hide') {
+      return {
+        title: count === 1 ? '仅删除生产者' : '仅删除所选生产者',
+        message: count === 1
+          ? '确定要把来源「' + items[0] + '」从生产者列表删除吗？'
+          : '确定要把选中的 ' + formatNumber(count) + ' 个来源从生产者列表删除吗？',
+        warning: '只删除生产者条目，不删除它的事件。该来源再次发布事件时会重新出现。',
+        submitLabel: '仅删来源',
+        busyLabel: '正在移除…',
+        danger: false
+      };
+    }
+
+    return {
+      title: count === 1 ? '删除来源' : '删除所选来源',
+      message: count === 1
+        ? '确定要删除来源「' + items[0] + '」吗？'
+        : '确定要删除选中的 ' + formatNumber(count) + ' 个来源吗？',
+      warning: count === 1
+        ? '删除该来源会一并删除它的全部事件，且无法恢复。'
+        : '删除这些来源会一并删除它们的全部事件，且无法恢复。'
+    };
+  }
+
+  async function performConfirmedDelete() {
+    var confirm = state.confirm;
+    if (!confirm || state.deleteBusy) {
+      return;
+    }
+
+    if (!confirm.items || confirm.items.length === 0) {
+      showConfirmError('没有可删除的项目。');
+      return;
+    }
+    if (confirm.items.length > MAX_DELETE_BATCH) {
+      showConfirmError('一次最多删除 1000 项，请分批操作。');
+      return;
+    }
+
+    var request = deleteRequestFor(confirm.kind, confirm.items);
+    if (!request) {
+      showConfirmError('没有可删除的项目。');
+      return;
+    }
+
+    clearConfirmError();
+    setConfirmBusy(true);
+
+    try {
+      var payload = await requestJSON(request.url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json'
+        },
+        body: JSON.stringify(request.body)
+      });
+
+      if (!state.auth.authenticated) {
+        setConfirmBusy(false);
+        return;
+      }
+      if (!isRecord(payload)) {
+        throw invalidPayload('delete');
+      }
+      var deleted = Number(confirm.kind === 'producers-hide'
+        ? payload.hidden : payload.deleted);
+      if (!Number.isFinite(deleted) || deleted < 0) {
+        throw invalidPayload('delete');
+      }
+
+      finishConfirmedDelete(confirm, deleted);
+    } catch (error) {
+      if (!state.auth.authenticated) {
+        setConfirmBusy(false);
+        return;
+      }
+      setConfirmBusy(false);
+      showConfirmError(deleteFailureMessage(error));
+      focusElement(el.confirmSubmit);
+    }
+  }
+
+  function deleteRequestFor(kind, items) {
+    if (kind === 'events') {
+      var events = [];
+      items.forEach(function (item) {
+        if (item && item.id && item.source) {
+          events.push({ id: item.id, source: item.source });
+        }
+      });
+      return events.length > 0
+        ? { url: '/api/events/delete', body: { events: events } }
+        : null;
+    }
+    if (kind === 'consumers') {
+      var names = items.filter(function (name) {
+        return typeof name === 'string' && name !== '';
+      });
+      return names.length > 0
+        ? { url: '/api/consumers/delete', body: { names: names } }
+        : null;
+    }
+    if (kind === 'producers') {
+      var sources = items.filter(function (source) {
+        return typeof source === 'string' && source !== '';
+      });
+      return sources.length > 0
+        ? { url: '/api/producers/delete', body: { sources: sources } }
+        : null;
+    }
+    if (kind === 'producers-hide') {
+      var hidden = items.filter(function (source) {
+        return typeof source === 'string' && source !== '';
+      });
+      return hidden.length > 0
+        ? { url: '/api/producers/hide', body: { sources: hidden } }
+        : null;
+    }
+    return null;
+  }
+
+  function finishConfirmedDelete(confirm, deleted) {
+    var kind = confirm.kind;
+
+    if (kind === 'events') {
+      clearEventSelection(false);
+      cancelPageLoad();
+      loadEventsPage({ silent: true });
+    } else if (kind === 'consumers') {
+      var removedNames = new Set(confirm.items);
+      clearConsumerSelection(false);
+      state.consumers = state.consumers.filter(function (consumer) {
+        return !removedNames.has(consumerDeleteName(consumer));
+      });
+      applyKpis();
+      renderConsumers();
+    } else if (kind === 'producers' || kind === 'producers-hide') {
+      var removedSources = new Set(confirm.items);
+      clearProducerSelection(false);
+      state.producers = state.producers.filter(function (producer) {
+        return !removedSources.has(producer.source);
+      });
+      renderProducers();
+    }
+
+    setDeleteStatus(deleteSuccessMessage(kind, deleted, confirm.items.length));
+    closeConfirmDialog({ focus: confirm.fallback });
+  }
+
+  function deleteFailureMessage(error) {
+    if (error && error.timeout) {
+      return '删除请求超时，请重试。';
+    }
+    if (error && error.network) {
+      return '连不上服务，请检查连接后重试。';
+    }
+    if (error && error.status === 400) {
+      return '删除请求没有通过检查，请刷新后重试。';
+    }
+    if (error && error.status === 403) {
+      return '没有权限执行删除，请刷新后重试。';
+    }
+    if (error && error.status === 404) {
+      return '部分内容已不存在，请刷新后重试。';
+    }
+    if (error && error.status >= 500) {
+      return '服务暂时不可用，请稍后重试。';
+    }
+    return '删除失败，请重试。';
+  }
+
+  function deleteSuccessMessage(kind, deleted, requestedCount) {
+    if (deleted <= 0) {
+      return '没有可删除的项目，列表已刷新。';
+    }
+    if (kind === 'events') {
+      return '已删除 ' + formatNumber(deleted) + ' 条事件。';
+    }
+    if (kind === 'consumers') {
+      return '已删除 ' + formatNumber(deleted) + ' 个消费者。';
+    }
+    if (kind === 'producers-hide') {
+      return '已从生产者列表删除 ' + formatNumber(requestedCount) +
+        ' 个来源，事件保留。';
+    }
+    // 生产者删除接口返回的是删除的事件数，来源数量以请求为准。
+    return '已删除 ' + formatNumber(requestedCount) + ' 个来源，共 ' +
+      formatNumber(deleted) + ' 条事件。';
+  }
+
+  function setDeleteStatus(message) {
+    el.deleteStatus.textContent = message;
+  }
+
+  function showConfirmError(message) {
+    el.confirmErrorText.textContent = message;
+    el.confirmError.hidden = false;
+  }
+
+  function clearConfirmError() {
+    el.confirmError.hidden = true;
+    el.confirmErrorText.textContent = '';
+  }
+
+  function setConfirmBusy(busy) {
+    state.deleteBusy = busy;
+    var confirm = state.confirm;
+    var label = confirm && confirm.submitLabel ? confirm.submitLabel : '删除';
+    var busyLabel = confirm && confirm.busyLabel ? confirm.busyLabel : '删除中…';
+    el.confirmSubmit.disabled = busy;
+    el.confirmCancel.disabled = busy;
+    el.confirmSubmit.setAttribute('aria-busy', busy ? 'true' : 'false');
+    el.confirmSubmit.textContent = busy ? busyLabel : label;
+  }
+
+  function closeConfirmDialog(options) {
+    var opts = options || {};
+    var confirm = state.confirm;
+
+    if (!confirm && !el.confirmDialog.open) {
+      return;
+    }
+
+    if (confirm) {
+      if (opts.restoreFocus === false) {
+        confirm.closeFocus = null;
+      } else if (opts.focus) {
+        confirm.closeFocus = opts.focus;
+      } else {
+        confirm.closeFocus = isElementFocusable(confirm.returnFocus)
+          ? confirm.returnFocus
+          : confirm.fallback;
+      }
+    }
+
+    if (el.confirmDialog.open) {
+      el.confirmDialog.close();
+    } else {
+      state.confirm = null;
+      setConfirmBusy(false);
+    }
+  }
+
+  function handleConfirmCancel(event) {
+    if (state.deleteBusy) {
+      event.preventDefault();
+    }
+  }
+
+  function handleConfirmClose() {
+    var confirm = state.confirm;
+    state.confirm = null;
+    setConfirmBusy(false);
+    clearConfirmError();
+
+    if (!confirm) {
+      return;
+    }
+
+    var target = confirm.closeFocus;
+    if (target === undefined) {
+      target = isElementFocusable(confirm.returnFocus)
+        ? confirm.returnFocus
+        : confirm.fallback;
+    }
+    focusElement(target);
+  }
+
+  /* ---- 事件详情 ---- */
+
+  function handleEventRowDoubleClick(event) {
+    if (!(event.target instanceof Element)) {
+      return;
+    }
+    if (event.target.closest('input, label, button, a, select, textarea, [contenteditable="true"]')) {
+      return;
+    }
+    var row = event.target.closest('tr');
+    if (!row || row.parentNode !== el.eventRows) {
+      return;
+    }
+    var item = eventForRow(row);
+    if (!item) {
+      return;
+    }
+    openEventDetail(item, row);
+  }
+
+  function eventForRow(row) {
+    var item = state.detailRowData.get(row);
+    if (item) {
+      return item;
+    }
+    var rows = el.eventRows.children;
+    for (var i = 0; i < rows.length; i += 1) {
+      if (rows[i] === row) {
+        return state.pageEvents[i] || null;
+      }
+    }
+    return null;
+  }
+
+  function openEventDetail(item, row) {
+    if (!item || state.confirm || el.confirmDialog.open || el.eventDetailDialog.open) {
+      return;
+    }
+
+    state.detail = {
+      row: row,
+      returnFocus: document.activeElement
+    };
+
+    renderEventDetail(item);
+
+    if (row && !row.hasAttribute('tabindex')) {
+      row.setAttribute('tabindex', '-1');
+    }
+
+    el.eventDetailDialog.showModal();
+    focusElement(el.eventDetailClose);
+  }
+
+  function renderEventDetail(item) {
+    resetEventDetailStatus();
+
+    var types = eventTypes(item);
+    el.eventDetailTypes.textContent = '';
+    if (types.length === 0) {
+      var emptyChip = document.createElement('span');
+      emptyChip.className = 'type-chip';
+      emptyChip.textContent = '—';
+      el.eventDetailTypes.appendChild(emptyChip);
+    } else {
+      types.forEach(function (type) {
+        var chip = document.createElement('span');
+        chip.className = 'type-chip';
+        chip.textContent = type;
+        chip.setAttribute('title', type);
+        el.eventDetailTypes.appendChild(chip);
+      });
+    }
+
+    var rawSource = item && typeof item.source === 'string' ? item.source : '';
+    el.eventDetailSource.textContent = rawSource || '未知';
+
+    var id = eventDeleteId(item);
+    el.eventDetailId.textContent = id || '—';
+
+    var rawTime = item && typeof item.time === 'string' ? item.time : '';
+    var parsed = rawTime ? Date.parse(rawTime) : NaN;
+    if (rawTime && !Number.isNaN(parsed)) {
+      el.eventDetailTime.textContent = fullTime(rawTime);
+      el.eventDetailTime.setAttribute('datetime', rawTime);
+    } else {
+      el.eventDetailTime.textContent = rawTime ? '时间未知' : '—';
+      el.eventDetailTime.removeAttribute('datetime');
+    }
+
+    if (rawTime) {
+      el.eventDetailTimeRaw.textContent = '原始 · ' + rawTime;
+      el.eventDetailTimeRaw.hidden = false;
+    } else {
+      el.eventDetailTimeRaw.textContent = '';
+      el.eventDetailTimeRaw.hidden = true;
+    }
+
+    el.eventDetailJson.textContent = prettyJSON(item && item.data);
+    el.eventDetailBody.scrollTop = 0;
+    el.eventDetailJson.scrollTop = 0;
+  }
+
+  function closeEventDetailDialog() {
+    if (el.eventDetailDialog.open) {
+      el.eventDetailDialog.close();
+    }
+  }
+
+  function handleEventDetailPointerDown(event) {
+    state.detailBackdropDown = event.target === el.eventDetailDialog;
+  }
+
+  function handleEventDetailClick(event) {
+    if (event.target !== el.eventDetailDialog) {
+      state.detailBackdropDown = false;
+      return;
+    }
+    if (!state.detailBackdropDown) {
+      return;
+    }
+    state.detailBackdropDown = false;
+    closeEventDetailDialog();
+  }
+
+  function handleEventDetailClose() {
+    var detail = state.detail;
+    state.detail = null;
+    state.detailBackdropDown = false;
+    resetEventDetailStatus();
+
+    if (!detail) {
+      return;
+    }
+
+    var target = null;
+    if (isElementFocusable(detail.row)) {
+      target = detail.row;
+    } else if (detail.returnFocus &&
+        detail.returnFocus !== document.body &&
+        detail.returnFocus !== document.documentElement &&
+        isElementFocusable(detail.returnFocus)) {
+      target = detail.returnFocus;
+    } else {
+      target = el.eventsTitle;
+    }
+    focusElement(target);
+  }
+
+  function copyEventDetailJson() {
+    var text = el.eventDetailJson.textContent || '';
+    if (!text) {
+      showEventDetailStatus('没有可复制的内容。', true);
+      return;
+    }
+    copyTextToClipboard(text).then(function (ok) {
+      if (!state.detail) {
+        return;
+      }
+      showEventDetailStatus(ok ? '已复制完整 JSON。' : '复制失败，请手动选择内容。', !ok);
+    });
+  }
+
+  function showEventDetailStatus(message, negative) {
+    el.eventDetailStatus.textContent = message;
+    el.eventDetailStatus.classList.toggle('is-negative', Boolean(negative));
+    if (state.detailStatusTimer) {
+      window.clearTimeout(state.detailStatusTimer);
+    }
+    state.detailStatusTimer = window.setTimeout(function () {
+      state.detailStatusTimer = null;
+      el.eventDetailStatus.textContent = '';
+      el.eventDetailStatus.classList.remove('is-negative');
+    }, 2600);
+  }
+
+  function resetEventDetailStatus() {
+    if (state.detailStatusTimer) {
+      window.clearTimeout(state.detailStatusTimer);
+      state.detailStatusTimer = null;
+    }
+    el.eventDetailStatus.textContent = '';
+    el.eventDetailStatus.classList.remove('is-negative');
+  }
+
+  function copyTextToClipboard(text) {
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+      return navigator.clipboard.writeText(text).then(function () {
+        return true;
+      }, function () {
+        return fallbackCopyText(text);
+      });
+    }
+    return Promise.resolve(fallbackCopyText(text));
+  }
+
+  function fallbackCopyText(text) {
+    var area = document.createElement('textarea');
+    area.value = text;
+    area.setAttribute('readonly', '');
+    area.style.position = 'fixed';
+    area.style.top = '0';
+    area.style.left = '-9999px';
+    document.body.appendChild(area);
+
+    var copied = false;
+    try {
+      area.select();
+      copied = document.execCommand('copy');
+    } catch (error) {
+      copied = false;
+    }
+    document.body.removeChild(area);
+    return copied;
   }
 
   /* ---- 失败记录页 ---- */
@@ -2384,6 +4665,13 @@
   /* ---- 侧栏加载状态 ---- */
 
   function showSideLoading() {
+    clearConsumerSelection(false);
+    clearProducerSelection(false);
+    el.consumersSelectAll.disabled = true;
+    el.producersSelectAll.disabled = true;
+    el.consumersSelection.hidden = true;
+    el.producersSelection.hidden = true;
+
     el.consumersSkeleton.hidden = false;
     el.consumerList.hidden = true;
     el.consumersEmpty.hidden = true;
@@ -2399,6 +4687,13 @@
   }
 
   function showSideWaiting() {
+    clearConsumerSelection(false);
+    clearProducerSelection(false);
+    el.consumersSelectAll.disabled = true;
+    el.producersSelectAll.disabled = true;
+    el.consumersSelection.hidden = true;
+    el.producersSelection.hidden = true;
+
     el.consumersSkeleton.hidden = true;
     el.consumerList.hidden = true;
     el.consumersEmpty.hidden = false;
@@ -2461,12 +4756,19 @@
   /* ---- 请求 ---- */
 
   async function requestJSON(url, options) {
+    var authCheck = Boolean(options && options.authCheck);
+    var requireStatus = options && typeof options.requireStatus === 'number'
+      ? options.requireStatus
+      : null;
+    var authGeneration = state.auth.generation;
     var controller = new AbortController();
     var timeoutId = window.setTimeout(function () {
       controller.abort();
     }, REQUEST_TIMEOUT_MS);
 
     var request = Object.assign({}, options || {});
+    delete request.authCheck;
+    delete request.requireStatus;
     request.signal = controller.signal;
     request.cache = 'no-store';
     if (!request.headers) {
@@ -2506,7 +4808,18 @@
         } else if (raw) {
           apiError.detail = raw.slice(0, 200);
         }
+        if (response.status === 401 &&
+            !authCheck &&
+            state.auth.generation === authGeneration) {
+          handleUnauthorized();
+        }
         throw apiError;
+      }
+
+      if (requireStatus !== null && response.status !== requireStatus) {
+        var statusError = new Error('unexpected status');
+        statusError.status = response.status;
+        throw statusError;
       }
 
       if (!raw) {
@@ -2637,6 +4950,18 @@
     }
   }
 
+  function prettyJSON(value) {
+    if (value === undefined) {
+      return '{}';
+    }
+    try {
+      var text = JSON.stringify(value, null, 2);
+      return typeof text === 'string' ? text : String(value);
+    } catch (error) {
+      return String(value);
+    }
+  }
+
   function tableTime(raw) {
     var time = Date.parse(raw);
     if (Number.isNaN(time)) {
@@ -2659,6 +4984,20 @@
 
     return date.getFullYear() + '/' +
       pad2(date.getMonth() + 1) + '/' + pad2(date.getDate());
+  }
+
+  function completeTime(raw) {
+    var time = Date.parse(raw);
+    if (Number.isNaN(time)) {
+      return '—';
+    }
+    var date = new Date(time);
+    return date.getFullYear() + '-' +
+      pad2(date.getMonth() + 1) + '-' +
+      pad2(date.getDate()) + ' ' +
+      pad2(date.getHours()) + ':' +
+      pad2(date.getMinutes()) + ':' +
+      pad2(date.getSeconds());
   }
 
   function fullTime(raw) {

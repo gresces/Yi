@@ -13,20 +13,25 @@ import (
 
 // store 是总线的持久化后端。nil 表示纯内存。
 //
-// SQLite 实现:dir/yi.db,三张表。
-//   - events      只追加,seq 是总序
-//   - consumers   每个消费者的游标与统计
-//   - failures    Nack 记录
+// SQLite 实现:dir/yi.db,四张表。
+//   - events           只追加,seq 是总序
+//   - consumers        每个消费者的游标与统计
+//   - failures         Nack 记录
+//   - hidden_producers 从生产者列表里移除、但保留事件的来源
 //
 // inflight 不落盘:未确认的事件在重启后会重新投递,这正是 at-least-once。
 type store interface {
 	loadEvents() ([]storedEvent, int64, error)
 	appendEvent(storedEvent) (bool, error)
+	deleteEvents(seqs []int64) error
 	archiveEvents(upto int64) error
 	loadState() (persistedState, error)
 	saveConsumer(ConsumerState) error
 	deleteConsumer(name string) error
 	appendFailure(Failure) error
+	loadHiddenProducers() ([]string, error)
+	hideProducer(source string) error
+	unhideProducer(source string) error
 	close() error
 }
 
@@ -34,6 +39,7 @@ type store interface {
 type ConsumerState struct {
 	Name      string      `json:"name"`
 	Types     []EventType `json:"types"`
+	Patterns  []string    `json:"patterns,omitempty"`
 	Cursor    int64       `json:"cursor"`
 	Delivered uint64      `json:"delivered"`
 	Failed    uint64      `json:"failed"`
@@ -58,6 +64,7 @@ CREATE TABLE IF NOT EXISTS events (
 	"time"      TEXT NOT NULL,
 	data        TEXT NOT NULL,
 	archived    INTEGER NOT NULL DEFAULT 0,
+	deleted     INTEGER NOT NULL DEFAULT 0,
 	UNIQUE (source, id)
 );
 
@@ -66,6 +73,7 @@ CREATE INDEX IF NOT EXISTS idx_events_type ON events(type, seq);
 CREATE TABLE IF NOT EXISTS consumers (
 	name       TEXT PRIMARY KEY,
 	types      TEXT NOT NULL,
+	patterns   TEXT NOT NULL DEFAULT '[]',
 	cursor     INTEGER NOT NULL DEFAULT 0,
 	delivered  INTEGER NOT NULL DEFAULT 0,
 	failed     INTEGER NOT NULL DEFAULT 0,
@@ -81,6 +89,10 @@ CREATE TABLE IF NOT EXISTS failures (
 	source   TEXT NOT NULL,
 	error    TEXT NOT NULL,
 	at       TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS hidden_producers (
+	source TEXT PRIMARY KEY
 );
 `
 
@@ -150,6 +162,20 @@ func openSQLiteStore(dir string) (*sqliteStore, error) {
 		return nil, err
 	}
 
+	var hasDeleted int
+	if err := db.QueryRow(
+		`SELECT count(*) FROM pragma_table_info('events') WHERE name = 'deleted'`,
+	).Scan(&hasDeleted); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("bus: inspect events.deleted: %w", err)
+	}
+	if hasDeleted == 0 {
+		if _, err := db.Exec(`ALTER TABLE events ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0`); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("bus: migrate events.deleted: %w", err)
+		}
+	}
+
 	var hasLastAt int
 	if err := db.QueryRow(
 		`SELECT count(*) FROM pragma_table_info('consumers') WHERE name = 'last_at'`,
@@ -161,6 +187,20 @@ func openSQLiteStore(dir string) (*sqliteStore, error) {
 		if _, err := db.Exec(`ALTER TABLE consumers ADD COLUMN last_at TEXT NOT NULL DEFAULT ''`); err != nil {
 			db.Close()
 			return nil, fmt.Errorf("bus: migrate consumers.last_at: %w", err)
+		}
+	}
+
+	var hasPatterns int
+	if err := db.QueryRow(
+		`SELECT count(*) FROM pragma_table_info('consumers') WHERE name = 'patterns'`,
+	).Scan(&hasPatterns); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("bus: inspect consumers.patterns: %w", err)
+	}
+	if hasPatterns == 0 {
+		if _, err := db.Exec(`ALTER TABLE consumers ADD COLUMN patterns TEXT NOT NULL DEFAULT '[]'`); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("bus: migrate consumers.patterns: %w", err)
 		}
 	}
 
@@ -219,7 +259,7 @@ func (s *sqliteStore) loadEvents() ([]storedEvent, int64, error) {
 	}
 
 	rows, err := s.db.Query(`
-		SELECT seq, received_at, id, source, type, types, "time", data
+		SELECT seq, received_at, id, source, type, types, "time", data, deleted
 		FROM events WHERE archived = 0 ORDER BY seq`)
 	if err != nil {
 		return nil, 0, fmt.Errorf("bus: query events: %w", err)
@@ -237,8 +277,9 @@ func (s *sqliteStore) loadEvents() ([]storedEvent, int64, error) {
 			typesRaw   string
 			occurredAt string
 			data       string
+			deleted    int
 		)
-		if err := rows.Scan(&seq, &receivedAt, &id, &source, &legacyType, &typesRaw, &occurredAt, &data); err != nil {
+		if err := rows.Scan(&seq, &receivedAt, &id, &source, &legacyType, &typesRaw, &occurredAt, &data, &deleted); err != nil {
 			return nil, 0, fmt.Errorf("bus: scan event: %w", err)
 		}
 
@@ -275,6 +316,7 @@ func (s *sqliteStore) loadEvents() ([]storedEvent, int64, error) {
 			seq:        seq,
 			receivedAt: received,
 			event:      ev,
+			deleted:    deleted != 0,
 		})
 	}
 	return out, base, rows.Err()
@@ -313,6 +355,36 @@ func (s *sqliteStore) appendEvent(se storedEvent) (bool, error) {
 	return n > 0, nil
 }
 
+func (s *sqliteStore) deleteEvents(seqs []int64) error {
+	if len(seqs) == 0 {
+		return nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("bus: begin delete events: %w", err)
+	}
+	stmt, err := tx.Prepare(`UPDATE events SET deleted = 1 WHERE seq = ? AND archived = 0 AND deleted = 0`)
+	if err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("bus: prepare delete events: %w", err)
+	}
+	for _, seq := range seqs {
+		if _, err := stmt.Exec(seq); err != nil {
+			_ = stmt.Close()
+			_ = tx.Rollback()
+			return fmt.Errorf("bus: delete event %d: %w", seq, err)
+		}
+	}
+	if err := stmt.Close(); err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("bus: close delete events: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("bus: commit delete events: %w", err)
+	}
+	return nil
+}
+
 func (s *sqliteStore) archiveEvents(upto int64) error {
 	if _, err := s.db.Exec(
 		`UPDATE events SET archived = 1 WHERE archived = 0 AND seq <= ?`, upto,
@@ -329,23 +401,28 @@ func (s *sqliteStore) loadState() (persistedState, error) {
 	}
 
 	rows, err := s.db.Query(`
-		SELECT name, types, cursor, delivered, failed, last_error, last_event, last_at
+		SELECT name, types, patterns, cursor, delivered, failed, last_error, last_event, last_at
 		FROM consumers ORDER BY name`)
 	if err != nil {
 		return state, fmt.Errorf("bus: query consumers: %w", err)
 	}
 	for rows.Next() {
 		var (
-			cs    ConsumerState
-			types string
+			cs       ConsumerState
+			types    string
+			patterns string
 		)
-		if err := rows.Scan(&cs.Name, &types, &cs.Cursor, &cs.Delivered, &cs.Failed, &cs.LastError, &cs.LastEvent, &cs.LastAt); err != nil {
+		if err := rows.Scan(&cs.Name, &types, &patterns, &cs.Cursor, &cs.Delivered, &cs.Failed, &cs.LastError, &cs.LastEvent, &cs.LastAt); err != nil {
 			rows.Close()
 			return state, fmt.Errorf("bus: scan consumer: %w", err)
 		}
 		if err := json.Unmarshal([]byte(types), &cs.Types); err != nil {
 			rows.Close()
 			return state, fmt.Errorf("bus: consumer %q types: %w", cs.Name, err)
+		}
+		if err := json.Unmarshal([]byte(patterns), &cs.Patterns); err != nil {
+			rows.Close()
+			return state, fmt.Errorf("bus: consumer %q patterns: %w", cs.Name, err)
 		}
 		state.Consumers = append(state.Consumers, cs)
 	}
@@ -385,19 +462,24 @@ func (s *sqliteStore) saveConsumer(c ConsumerState) error {
 	if err != nil {
 		return fmt.Errorf("bus: encode types: %w", err)
 	}
+	patterns, err := json.Marshal(c.Patterns)
+	if err != nil {
+		return fmt.Errorf("bus: encode patterns: %w", err)
+	}
 
 	if _, err := s.db.Exec(`
-		INSERT INTO consumers (name, types, cursor, delivered, failed, last_error, last_event, last_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO consumers (name, types, patterns, cursor, delivered, failed, last_error, last_event, last_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(name) DO UPDATE SET
 			types      = excluded.types,
+			patterns   = excluded.patterns,
 			cursor     = excluded.cursor,
 			delivered  = excluded.delivered,
 			failed     = excluded.failed,
 			last_error = excluded.last_error,
 			last_event = excluded.last_event,
 			last_at    = excluded.last_at`,
-		c.Name, string(types), c.Cursor, c.Delivered, c.Failed, c.LastError, c.LastEvent, c.LastAt,
+		c.Name, string(types), string(patterns), c.Cursor, c.Delivered, c.Failed, c.LastError, c.LastEvent, c.LastAt,
 	); err != nil {
 		return fmt.Errorf("bus: save consumer %q: %w", c.Name, err)
 	}
@@ -418,6 +500,40 @@ func (s *sqliteStore) appendFailure(f Failure) error {
 		f.Consumer, f.EventID, f.Source, f.Error, f.At.Format(time.RFC3339Nano),
 	); err != nil {
 		return fmt.Errorf("bus: append failure: %w", err)
+	}
+	return nil
+}
+
+func (s *sqliteStore) loadHiddenProducers() ([]string, error) {
+	rows, err := s.db.Query(`SELECT source FROM hidden_producers ORDER BY source`)
+	if err != nil {
+		return nil, fmt.Errorf("bus: query hidden producers: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]string, 0)
+	for rows.Next() {
+		var source string
+		if err := rows.Scan(&source); err != nil {
+			return nil, fmt.Errorf("bus: scan hidden producer: %w", err)
+		}
+		out = append(out, source)
+	}
+	return out, rows.Err()
+}
+
+func (s *sqliteStore) hideProducer(source string) error {
+	if _, err := s.db.Exec(
+		`INSERT OR IGNORE INTO hidden_producers (source) VALUES (?)`, source,
+	); err != nil {
+		return fmt.Errorf("bus: hide producer %q: %w", source, err)
+	}
+	return nil
+}
+
+func (s *sqliteStore) unhideProducer(source string) error {
+	if _, err := s.db.Exec(`DELETE FROM hidden_producers WHERE source = ?`, source); err != nil {
+		return fmt.Errorf("bus: unhide producer %q: %w", source, err)
 	}
 	return nil
 }

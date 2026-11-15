@@ -48,16 +48,21 @@ class Model:
         return None
 
 
-def http_json(base: str, path: str) -> Any:
-    with urllib.request.urlopen(base + path, timeout=10) as response:
+def http_json(base: str, path: str, token: str = "") -> Any:
+    request = urllib.request.Request(base + path)
+    if token:
+        request.add_header("Authorization", "Bearer " + token)
+    with urllib.request.urlopen(request, timeout=10) as response:
         return json.load(response)
 
 
-def fetch_events_page(base: str, limit: int, offset: int, typ: str = "") -> Dict[str, Any]:
+def fetch_events_page(
+    base: str, limit: int, offset: int, typ: str = "", token: str = ""
+) -> Dict[str, Any]:
     query = {"limit": str(limit), "offset": str(offset)}
     if typ:
         query["type"] = typ
-    return http_json(base, "/api/events?" + urllib.parse.urlencode(query))
+    return http_json(base, "/api/events?" + urllib.parse.urlencode(query), token)
 
 
 def check(condition: bool, message: str) -> None:
@@ -69,6 +74,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Yi model-based logic check")
     parser.add_argument("--base-url", default="http://127.0.0.1:8081")
     parser.add_argument("--frontend-url", default="http://127.0.0.1:8080")
+    parser.add_argument("--token", default=os.environ.get("YI_TOKEN", ""),
+                        help="Bearer 认证令牌,默认读 YI_TOKEN")
     parser.add_argument("--events", type=int, default=300)
     parser.add_argument("--consumers", type=int, default=3)
     parser.add_argument("--rounds", type=int, default=6)
@@ -77,7 +84,7 @@ def main() -> int:
 
     rng = random.Random(args.seed)
     run_id = "logic-%d" % os.getpid()
-    client = Client(args.base_url, timeout=10)
+    client = Client(args.base_url, timeout=10, token=args.token)
 
     baseline = len(client.events(limit=0))
     check(baseline == 0, "logic check expects an empty database, found %d events" % baseline)
@@ -196,7 +203,7 @@ def main() -> int:
     offset = 0
     collected: List[str] = []
     while True:
-        page = fetch_events_page(args.frontend_url, 50, offset)
+        page = fetch_events_page(args.frontend_url, 50, offset, token=args.token)
         check(page["total"] == len(events), "page total mismatch")
         if not page["events"]:
             break
@@ -207,13 +214,13 @@ def main() -> int:
     # ---- 类型筛选 ----
     for typ in TYPE_POOL:
         expected = [e["id"] for e in events if typ in e["types"]]
-        page = fetch_events_page(args.frontend_url, 200, 0, typ)
+        page = fetch_events_page(args.frontend_url, 200, 0, typ, token=args.token)
         check(page["total"] == len(expected),
               "filter %s total %d != %d" % (typ, page["total"], len(expected)))
         collected = []
         offset = 0
         while True:
-            page = fetch_events_page(args.frontend_url, 200, offset, typ)
+            page = fetch_events_page(args.frontend_url, 200, offset, typ, token=args.token)
             if not page["events"]:
                 break
             collected = [event["id"] for event in page["events"]] + collected

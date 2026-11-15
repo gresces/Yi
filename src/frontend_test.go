@@ -39,7 +39,7 @@ func TestEventsPagination(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	srv := httptest.NewServer(frontendHandler(b))
+	srv := httptest.NewServer(frontendHandler(b, newAuth("")))
 	defer srv.Close()
 
 	type page struct {
@@ -108,7 +108,7 @@ func TestFailuresPagination(t *testing.T) {
 		}
 	}
 
-	srv := httptest.NewServer(frontendHandler(b))
+	srv := httptest.NewServer(frontendHandler(b, newAuth("")))
 	defer srv.Close()
 
 	resp, err := srv.Client().Get(srv.URL + "/api/failures?limit=1&offset=0")
@@ -138,7 +138,7 @@ func TestStreamPushesSnapshots(t *testing.T) {
 	b := bus.New()
 	defer b.Close()
 
-	srv := httptest.NewServer(frontendHandler(b))
+	srv := httptest.NewServer(frontendHandler(b, newAuth("")))
 	defer srv.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -222,7 +222,7 @@ func TestMetricsEndpoint(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	srv := httptest.NewServer(frontendHandler(b))
+	srv := httptest.NewServer(frontendHandler(b, newAuth("")))
 	defer srv.Close()
 
 	resp, err := srv.Client().Get(srv.URL + "/api/metrics?window=10")
@@ -268,7 +268,7 @@ func TestStreamMultipleClients(t *testing.T) {
 	b := bus.New()
 	defer b.Close()
 
-	srv := httptest.NewServer(frontendHandler(b))
+	srv := httptest.NewServer(frontendHandler(b, newAuth("")))
 	defer srv.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())

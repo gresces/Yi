@@ -15,7 +15,7 @@ func newTestServer(t *testing.T) (*bus.Bus, *httptest.Server) {
 	t.Helper()
 
 	b := bus.New()
-	srv := httptest.NewServer(serviceHandler(b))
+	srv := httptest.NewServer(serviceHandler(b, newAuth("")))
 	t.Cleanup(func() {
 		srv.Close()
 		_ = b.Close()
@@ -215,6 +215,63 @@ func TestUnknownConsumer(t *testing.T) {
 		if code, _ := do(t, srv, tc.method, tc.path, nil); code != http.StatusNotFound {
 			t.Errorf("%s %s: got %d, want 404", tc.method, tc.path, code)
 		}
+	}
+}
+
+func TestConsumerPatternSubscription(t *testing.T) {
+	_, srv := newTestServer(t)
+
+	code, body := do(t, srv, http.MethodPut, "/consumers/pattern", map[string]any{
+		"patterns": []string{`^mail\.`, `^note$`},
+	})
+	if code != http.StatusCreated {
+		t.Fatalf("create pattern consumer: %d %s", code, body)
+	}
+	var stats bus.ConsumerStats
+	if err := json.Unmarshal(body, &stats); err != nil {
+		t.Fatal(err)
+	}
+	if len(stats.Patterns) != 2 || stats.Patterns[0] != "^mail\\." || stats.Patterns[1] != "^note$" {
+		t.Fatalf("patterns = %#v", stats.Patterns)
+	}
+	if len(stats.Types) != 0 {
+		t.Fatalf("types = %#v", stats.Types)
+	}
+
+	// A repeated identical registration is idempotent regardless of order.
+	code, body = do(t, srv, http.MethodPut, "/consumers/pattern", map[string]any{
+		"types":    []string{},
+		"patterns": []string{`^note$`, `^mail\.`},
+	})
+	if code != http.StatusOK {
+		t.Fatalf("repeat pattern consumer: %d %s", code, body)
+	}
+
+	code, body = do(t, srv, http.MethodPut, "/consumers/pattern", map[string]any{
+		"patterns": []string{`^other\.`},
+	})
+	if code != http.StatusConflict {
+		t.Fatalf("changed pattern consumer: %d %s", code, body)
+	}
+
+	code, body = do(t, srv, http.MethodPut, "/consumers/bad", map[string]any{
+		"patterns": []string{`(`},
+	})
+	if code != http.StatusBadRequest {
+		t.Fatalf("invalid pattern: %d %s", code, body)
+	}
+
+	code, body = do(t, srv, http.MethodPut, "/consumers/empty", map[string]any{})
+	if code != http.StatusBadRequest {
+		t.Fatalf("empty subscription: %d %s", code, body)
+	}
+
+	code, body = do(t, srv, http.MethodPut, "/consumers/mixed", map[string]any{
+		"types":    []string{"raw.captured"},
+		"patterns": []string{`^mail\.`},
+	})
+	if code != http.StatusCreated {
+		t.Fatalf("mixed subscription: %d %s", code, body)
 	}
 }
 

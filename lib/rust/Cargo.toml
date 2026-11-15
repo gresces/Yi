@@ -1,6 +1,6 @@
 [package]
 name = "yi-client"
-version = "0.1.1"
+version = "0.1.5"
 edition = "2021"
 rust-version = "1.74"
 description = "Zero-dependency Rust client for the Yi event service"

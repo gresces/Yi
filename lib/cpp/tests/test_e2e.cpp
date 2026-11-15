@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -46,7 +47,12 @@ int main(int argc, char **argv) {
     const std::string name = "cpp-e2e-" + suffix;
 
     try {
-        yi::Client client(base_url);
+        yi::ClientOptions client_options;
+        if (const char *token = std::getenv("YI_TOKEN");
+            token != nullptr && *token != '\0') {
+            client_options.token = token;
+        }
+        yi::Client client(base_url, client_options);
         CHECK(client.health() == "ok");
 
         // ---- producer: explicit event, duplicate detection -----------------
@@ -142,6 +148,43 @@ int main(int argc, char **argv) {
             });
         CHECK(failed != failure_list.end());
 
+        // ---- regex pattern subscriptions -----------------------------------
+
+        std::string escaped_type;
+        for (const char ch : type) {
+            if (ch == '.') {
+                escaped_type.push_back('\\');
+            }
+            escaped_type.push_back(ch);
+        }
+
+        const std::string pattern_name = name + "-pattern";
+        yi::ConsumerOptions pattern_options;
+        pattern_options.poll_timeout = std::chrono::seconds(5);
+        pattern_options.patterns = {"^" + escaped_type + R"(\.pattern$)"};
+
+        // Patterns-only: empty types are allowed when patterns are supplied.
+        yi::Consumer patterned(client, pattern_name, {}, pattern_options);
+        CHECK(patterned.types().empty());
+        CHECK(patterned.patterns() == pattern_options.patterns);
+
+        const std::string pattern_type = type + ".pattern";
+        auto pattern_event = yi::Event::create(
+            "cpp-lib", {pattern_type}, yi::json{{"text", "pattern match"}});
+        CHECK(!client.publish(pattern_event).duplicate);
+
+        auto pattern_message = patterned.next();
+        CHECK(pattern_message.has_value());
+        if (pattern_message) {
+            CHECK(pattern_message->event().id == pattern_event.id);
+            pattern_message->ack();
+        }
+
+        const auto pattern_stats = patterned.stats();
+        CHECK(pattern_stats.types.empty());
+        CHECK(pattern_stats.patterns == pattern_options.patterns);
+        CHECK(pattern_stats.delivered == 1);
+
         // ---- range-based iteration ----------------------------------------
 
         const std::string iter_type = type + ".iter";
@@ -180,6 +223,7 @@ int main(int argc, char **argv) {
         // ---- cleanup -------------------------------------------------------
 
         consumer.deregister();
+        patterned.deregister();
         client.deregister(iter_name);
     } catch (const std::exception &error) {
         std::fprintf(stderr, "FAIL exception: %s\n", error.what());

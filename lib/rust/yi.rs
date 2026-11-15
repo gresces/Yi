@@ -7,6 +7,10 @@
 //! The Yi service speaks plain HTTP. This client intentionally supports only
 //! `http://` URLs; terminate TLS in a proxy if you need it.
 //!
+//! When the service is configured with an `auth-token`, create the client with
+//! [`Client::with_token`] to send `Authorization: Bearer <token>` on every
+//! request.
+//!
 //! ```no_run
 //! use yi::{Client, Consumer};
 //!
@@ -33,7 +37,7 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub const VERSION: &str = "0.1.1";
+pub const VERSION: &str = "0.1.5";
 pub const DEFAULT_BASE_URL: &str = "http://127.0.0.1:8081";
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DEFAULT_POLL_TIMEOUT: Duration = Duration::from_secs(25);
@@ -824,6 +828,9 @@ impl PublishResult {
 pub struct ConsumerStats {
     pub name: String,
     pub types: Vec<String>,
+    /// Subscription patterns reported by the server. Empty when the consumer
+    /// only subscribes by exact type.
+    pub patterns: Vec<String>,
     pub cursor: i64,
     pub pending: i64,
     pub delivered: i64,
@@ -843,6 +850,7 @@ impl ConsumerStats {
         Ok(ConsumerStats {
             name: string_field(value, "name"),
             types: string_array(value, "types", "consumer stats types")?,
+            patterns: string_array(value, "patterns", "consumer stats patterns")?,
             cursor: int_field(value, "cursor"),
             pending: int_field(value, "pending"),
             delivered: int_field(value, "delivered"),
@@ -932,6 +940,18 @@ where
     types
 }
 
+/// Trim, drop empty entries, deduplicate and sort subscription patterns.
+///
+/// The server applies the same normalization and additionally validates each
+/// pattern as a Go RE2 regular expression.
+fn normalize_patterns<T, I>(patterns: I) -> Vec<String>
+where
+    T: Into<String>,
+    I: IntoIterator<Item = T>,
+{
+    normalize_types(patterns)
+}
+
 /// Options for [`Client::capture_with`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct CaptureOptions {
@@ -979,11 +999,24 @@ struct Origin {
     authority: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Client {
     origin: Origin,
     base_url: String,
     timeout: Duration,
+    token: Option<String>,
+}
+
+impl fmt::Debug for Client {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Client")
+            .field("origin", &self.origin)
+            .field("base_url", &self.base_url)
+            .field("timeout", &self.timeout)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 impl Client {
@@ -992,6 +1025,32 @@ impl Client {
     }
 
     pub fn with_timeout(base_url: impl Into<String>, timeout: Duration) -> Result<Self, Error> {
+        Self::build(base_url, timeout, None)
+    }
+
+    /// Create a client that sends `Authorization: Bearer <token>` on every
+    /// request. Use this when the service is configured with `auth-token`.
+    pub fn with_token(
+        base_url: impl Into<String>,
+        token: impl Into<String>,
+    ) -> Result<Self, Error> {
+        Self::with_token_and_timeout(base_url, token, DEFAULT_TIMEOUT)
+    }
+
+    /// Like [`Client::with_token`], with an explicit request timeout.
+    pub fn with_token_and_timeout(
+        base_url: impl Into<String>,
+        token: impl Into<String>,
+        timeout: Duration,
+    ) -> Result<Self, Error> {
+        Self::build(base_url, timeout, validate_token(token.into())?)
+    }
+
+    fn build(
+        base_url: impl Into<String>,
+        timeout: Duration,
+        token: Option<String>,
+    ) -> Result<Self, Error> {
         if timeout.is_zero() {
             return Err(Error::Protocol("timeout must be positive".into()));
         }
@@ -1002,6 +1061,7 @@ impl Client {
             origin,
             base_url: normalized,
             timeout,
+            token,
         })
     }
 
@@ -1011,6 +1071,11 @@ impl Client {
 
     pub fn timeout(&self) -> Duration {
         self.timeout
+    }
+
+    /// The bearer token sent with every request, if one was configured.
+    pub fn token(&self) -> Option<&str> {
+        self.token.as_deref()
     }
 
     pub fn health(&self) -> Result<String, Error> {
@@ -1091,12 +1156,35 @@ impl Client {
         T: Into<String>,
         I: IntoIterator<Item = T>,
     {
+        self.register_with_patterns(name, types, Vec::<String>::new())
+    }
+
+    /// Register a consumer with exact types and/or Go RE2 patterns.
+    ///
+    /// Patterns are matched against each event type (unanchored unless the
+    /// pattern uses `^`/`$`); matching types and patterns are combined with
+    /// union semantics. At least one non-empty type or pattern is required.
+    pub fn register_with_patterns<T, I, P, J>(
+        &self,
+        name: &str,
+        types: I,
+        patterns: J,
+    ) -> Result<ConsumerStats, Error>
+    where
+        T: Into<String>,
+        I: IntoIterator<Item = T>,
+        P: Into<String>,
+        J: IntoIterator<Item = P>,
+    {
         if name.is_empty() {
             return Err(Error::Protocol("consumer name is required".into()));
         }
         let types = normalize_types(types);
-        if types.is_empty() {
-            return Err(Error::Protocol("consumer needs at least one type".into()));
+        let patterns = normalize_patterns(patterns);
+        if types.is_empty() && patterns.is_empty() {
+            return Err(Error::Protocol(
+                "consumer needs at least one type or pattern".into(),
+            ));
         }
 
         let mut body = Json::object();
@@ -1104,6 +1192,12 @@ impl Client {
             "types",
             Json::Array(types.into_iter().map(Json::String).collect()),
         );
+        if !patterns.is_empty() {
+            body.insert(
+                "patterns",
+                Json::Array(patterns.into_iter().map(Json::String).collect()),
+            );
+        }
         let path = consumer_path(name);
         let response = self.request("PUT", &path, Some(&body), self.timeout)?;
         self.expect(&response, "PUT", &path, &[200, 201])?;
@@ -1197,6 +1291,7 @@ impl Client {
             &self.origin.authority,
             method,
             &full_path,
+            self.token.as_deref(),
             body.as_deref(),
             timeout,
         )
@@ -1248,6 +1343,7 @@ pub struct Consumer<'a> {
     client: &'a Client,
     name: String,
     types: Vec<String>,
+    patterns: Vec<String>,
     poll_timeout: Duration,
     closed: bool,
     // A consumer owns a single server-side inflight slot; sharing it across
@@ -1261,7 +1357,13 @@ impl<'a> Consumer<'a> {
         T: Into<String>,
         I: IntoIterator<Item = T>,
     {
-        Self::with_timeout(client, name, types, DEFAULT_POLL_TIMEOUT)
+        Self::with_patterns_and_timeout(
+            client,
+            name,
+            types,
+            Vec::<String>::new(),
+            DEFAULT_POLL_TIMEOUT,
+        )
     }
 
     pub fn with_timeout<T, I>(
@@ -1274,6 +1376,43 @@ impl<'a> Consumer<'a> {
         T: Into<String>,
         I: IntoIterator<Item = T>,
     {
+        Self::with_patterns_and_timeout(client, name, types, Vec::<String>::new(), poll_timeout)
+    }
+
+    /// Subscribe with exact types and/or Go RE2 patterns.
+    ///
+    /// Patterns match each event type (unanchored unless `^`/`$` are used) and
+    /// are combined with `types` using union semantics. Either list may be
+    /// empty, but not both.
+    pub fn with_patterns<T, I, P, J>(
+        client: &'a Client,
+        name: impl Into<String>,
+        types: I,
+        patterns: J,
+    ) -> Result<Self, Error>
+    where
+        T: Into<String>,
+        I: IntoIterator<Item = T>,
+        P: Into<String>,
+        J: IntoIterator<Item = P>,
+    {
+        Self::with_patterns_and_timeout(client, name, types, patterns, DEFAULT_POLL_TIMEOUT)
+    }
+
+    /// Like [`Consumer::with_patterns`], with an explicit poll timeout.
+    pub fn with_patterns_and_timeout<T, I, P, J>(
+        client: &'a Client,
+        name: impl Into<String>,
+        types: I,
+        patterns: J,
+        poll_timeout: Duration,
+    ) -> Result<Self, Error>
+    where
+        T: Into<String>,
+        I: IntoIterator<Item = T>,
+        P: Into<String>,
+        J: IntoIterator<Item = P>,
+    {
         if poll_timeout.is_zero() {
             return Err(Error::Protocol("poll timeout must be positive".into()));
         }
@@ -1282,14 +1421,18 @@ impl<'a> Consumer<'a> {
             return Err(Error::Protocol("consumer name is required".into()));
         }
         let types = normalize_types(types);
-        if types.is_empty() {
-            return Err(Error::Protocol("consumer needs at least one type".into()));
+        let patterns = normalize_patterns(patterns);
+        if types.is_empty() && patterns.is_empty() {
+            return Err(Error::Protocol(
+                "consumer needs at least one type or pattern".into(),
+            ));
         }
-        client.register(&name, types.clone())?;
+        client.register_with_patterns(&name, types.clone(), patterns.clone())?;
         Ok(Consumer {
             client,
             name,
             types,
+            patterns,
             poll_timeout,
             closed: false,
             _not_sync: PhantomData,
@@ -1302,6 +1445,11 @@ impl<'a> Consumer<'a> {
 
     pub fn types(&self) -> &[String] {
         &self.types
+    }
+
+    /// The regex patterns this consumer subscribes to.
+    pub fn patterns(&self) -> &[String] {
+        &self.patterns
     }
 
     pub fn is_closed(&self) -> bool {
@@ -1387,6 +1535,7 @@ fn http_request(
     authority: &str,
     method: &str,
     path: &str,
+    token: Option<&str>,
     body: Option<&str>,
     timeout: Duration,
 ) -> Result<HttpResponse, Error> {
@@ -1421,6 +1570,11 @@ fn http_request(
          Connection: close\r\n\
          User-Agent: yi-rust/{VERSION}\r\n"
     );
+    if let Some(token) = token {
+        request.push_str("Authorization: Bearer ");
+        request.push_str(token);
+        request.push_str("\r\n");
+    }
     if let Some(body) = body {
         request.push_str("Content-Type: application/json\r\n");
         request.push_str(&format!("Content-Length: {}\r\n", body.len()));
@@ -1584,6 +1738,18 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 // ---- URL, ids and time ----------------------------------------------------
+
+fn validate_token(token: String) -> Result<Option<String>, Error> {
+    if token.trim().is_empty() {
+        return Ok(None);
+    }
+    if token.contains('\r') || token.contains('\n') {
+        return Err(Error::Protocol(
+            "auth token must not contain CR or LF".into(),
+        ));
+    }
+    Ok(Some(token))
+}
 
 fn parse_base_url(input: &str) -> Result<Origin, Error> {
     let trimmed = input.trim();
@@ -1883,6 +2049,20 @@ mod tests {
         assert_eq!(stats.last_error.as_deref(), Some("boom"));
         assert_eq!(stats.last_event.as_deref(), Some("e1"));
         assert!(stats.last_at.is_none());
+        assert!(stats.patterns.is_empty());
+
+        let with_patterns = ConsumerStats::from_json(&Json::from_pairs([
+            ("name", Json::from("c")),
+            ("types", Json::Array(vec![])),
+            (
+                "patterns",
+                Json::Array(vec![Json::from("^mail\\."), Json::from("^note$")]),
+            ),
+            ("cursor", Json::from(0_i64)),
+        ]))
+        .unwrap();
+        assert!(with_patterns.types.is_empty());
+        assert_eq!(with_patterns.patterns, vec!["^mail\\.", "^note$"]);
 
         let failure = Failure::from_json(&Json::from_pairs([
             ("consumer", Json::from("c")),
@@ -2017,6 +2197,200 @@ mod tests {
         server.join().unwrap();
     }
 
+    fn captured_health_request(token: Option<&str>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 2048];
+            let read = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..read]).to_string();
+            let body = "ok\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\n\
+                 Content-Length: {}\r\n\
+                 Connection: close\r\n\
+                 \r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            request
+        });
+
+        let client = match token {
+            Some(token) => Client::with_token(format!("http://{address}"), token).unwrap(),
+            None => Client::new(format!("http://{address}")).unwrap(),
+        };
+        assert_eq!(client.health().unwrap(), "ok");
+        server.join().unwrap()
+    }
+
+    #[test]
+    fn sends_bearer_token_when_configured() {
+        let request = captured_health_request(Some("s3cret"));
+        assert!(
+            request.contains("\r\nAuthorization: Bearer s3cret\r\n"),
+            "request did not carry the bearer token:\n{request}"
+        );
+    }
+
+    #[test]
+    fn omits_authorization_without_token() {
+        let request = captured_health_request(None);
+        assert!(
+            !request.to_ascii_lowercase().contains("authorization:"),
+            "request unexpectedly carried an authorization header:\n{request}"
+        );
+    }
+
+    #[test]
+    fn token_configuration() {
+        let client = Client::with_token("http://127.0.0.1:8081", "abc").unwrap();
+        assert_eq!(client.token(), Some("abc"));
+        assert!(Client::new("http://127.0.0.1:8081")
+            .unwrap()
+            .token()
+            .is_none());
+
+        assert!(Client::with_token("http://127.0.0.1:8081", "")
+            .unwrap()
+            .token()
+            .is_none());
+        assert!(Client::with_token("http://127.0.0.1:8081", "   ")
+            .unwrap()
+            .token()
+            .is_none());
+        assert!(Client::with_token("http://127.0.0.1:8081", "a\r\nX-Evil: 1").is_err());
+    }
+
+    #[test]
+    fn register_with_patterns_sends_patterns() {
+        let stats = r#"{"name":"c","types":["raw.captured"],"patterns":["^mail\\.","^note$"],"cursor":0,"pending":0,"delivered":0,"failed":0}"#;
+        let (base, server) = one_shot_server(201, stats);
+        let client = Client::new(base).unwrap();
+
+        let registered = client
+            .register_with_patterns("c", ["raw.captured"], ["^note$", "^mail\\.", "^mail\\."])
+            .unwrap();
+        let request = server.join().unwrap();
+
+        assert!(request.starts_with("PUT /consumers/c HTTP/1.1\r\n"));
+        assert!(
+            request.contains(r#""patterns":["^mail\\.","^note$"]"#),
+            "request body did not carry the normalized patterns:\n{request}"
+        );
+        assert!(
+            request.contains(r#""types":["raw.captured"]"#),
+            "request body did not carry the types:\n{request}"
+        );
+        assert_eq!(registered.types, vec!["raw.captured"]);
+        assert_eq!(registered.patterns, vec!["^mail\\.", "^note$"]);
+    }
+
+    #[test]
+    fn register_allows_patterns_only() {
+        let stats = r#"{"name":"c","types":[],"patterns":["^mail\\."],"cursor":0,"pending":0,"delivered":0,"failed":0}"#;
+        let (base, server) = one_shot_server(201, stats);
+        let client = Client::new(base).unwrap();
+
+        let registered = client
+            .register_with_patterns("c", Vec::<String>::new(), ["^mail\\."])
+            .unwrap();
+        let request = server.join().unwrap();
+
+        assert!(
+            request.contains(r#""patterns":["^mail\\."]"#),
+            "request body did not carry the patterns:\n{request}"
+        );
+        assert!(
+            request.contains(r#""types":[]"#),
+            "patterns-only registration should send an empty types array:\n{request}"
+        );
+        assert!(registered.types.is_empty());
+        assert_eq!(registered.patterns, vec!["^mail\\."]);
+
+        let error = client
+            .register_with_patterns("c", Vec::<String>::new(), Vec::<String>::new())
+            .unwrap_err();
+        assert!(matches!(error, Error::Protocol(_)));
+    }
+
+    #[test]
+    fn consumer_with_patterns_registers_and_exposes_patterns() {
+        let stats = r#"{"name":"c","types":[],"patterns":["^mail\\."],"cursor":0,"pending":0,"delivered":0,"failed":0}"#;
+        let (base, server) = one_shot_server(201, stats);
+        let client = Client::new(base).unwrap();
+
+        let consumer =
+            Consumer::with_patterns(&client, "c", Vec::<String>::new(), ["^mail\\."]).unwrap();
+        let request = server.join().unwrap();
+
+        assert!(
+            request.contains(r#""patterns":["^mail\\."]"#),
+            "request body did not carry the patterns:\n{request}"
+        );
+        assert!(
+            request.contains(r#""types":[]"#),
+            "patterns-only registration should send an empty types array:\n{request}"
+        );
+        assert!(consumer.types().is_empty());
+        assert_eq!(consumer.patterns().to_vec(), vec!["^mail\\."]);
+
+        assert!(
+            Consumer::with_patterns(&client, "d", Vec::<String>::new(), Vec::<String>::new())
+                .is_err()
+        );
+    }
+
+    /// Accept one HTTP request, reply with `status`/`body`, and hand the raw
+    /// request text back to the test.
+    fn one_shot_server(status: u16, body: &str) -> (String, thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = body.to_string();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 1024];
+            loop {
+                let read = stream.read(&mut chunk).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                let text = String::from_utf8_lossy(&request);
+                if let Some(header_end) = text.find("\r\n\r\n") {
+                    let content_length = text[..header_end]
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            if name.eq_ignore_ascii_case("content-length") {
+                                value.trim().parse::<usize>().ok()
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= header_end + 4 + content_length {
+                        break;
+                    }
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 {status} Created\r\n\
+                 Content-Length: {}\r\n\
+                 Connection: close\r\n\
+                 \r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            String::from_utf8_lossy(&request).to_string()
+        });
+        (format!("http://{address}"), server)
+    }
+
     #[test]
     fn live_e2e() {
         let base = match std::env::var("YI_BASE_URL") {
@@ -2027,7 +2401,10 @@ mod tests {
             }
         };
 
-        let client = Client::new(base).unwrap();
+        let client = match std::env::var("YI_TOKEN") {
+            Ok(token) if !token.trim().is_empty() => Client::with_token(base, token).unwrap(),
+            _ => Client::new(base).unwrap(),
+        };
         assert_eq!(client.health().unwrap(), "ok");
 
         let suffix = format!(

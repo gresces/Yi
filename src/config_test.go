@@ -42,6 +42,7 @@ frontend-port = 9092
 frontend = false
 data = "/var/lib/yi data"
 archive-batch = 7
+auth-token = config-token-0123456789
 `)
 
 	cfg, err := loadConfigFile(path)
@@ -72,10 +73,13 @@ archive-batch = 7
 	if s.ArchiveBatch != 7 {
 		t.Errorf("archive-batch = %d", s.ArchiveBatch)
 	}
+	if s.AuthToken != "config-token-0123456789" {
+		t.Errorf("auth-token = %q", s.AuthToken)
+	}
 }
 
 func TestGeneratedServiceConfigIsValid(t *testing.T) {
-	path := writeConfigFile(t, renderServiceConfig("yi"))
+	path := writeConfigFile(t, renderServiceConfig("yi", "test-token-0123456789"))
 
 	cfg, err := loadConfigFile(path)
 	if err != nil {
@@ -90,6 +94,9 @@ func TestGeneratedServiceConfigIsValid(t *testing.T) {
 	}
 	if !s.Frontend {
 		t.Error("generated config should enable the frontend")
+	}
+	if s.AuthToken != "test-token-0123456789" {
+		t.Errorf("auth-token = %q", s.AuthToken)
 	}
 }
 
@@ -123,6 +130,8 @@ func TestLoadConfigFileErrors(t *testing.T) {
 		{"bad bool", "frontend = maybe\n", "expected boolean"},
 		{"unterminated quote", "data = \"unterminated\n", "unterminated quoted value"},
 		{"bad archive", "archive-batch = nope\n", "expected integer"},
+		{"bad auth token", "auth-token = two words with enough length\n", "unsupported character"},
+		{"short auth token", "auth-token = short\n", "at least 16"},
 	}
 
 	for _, test := range tests {
@@ -161,6 +170,7 @@ frontend-port = 9092
 frontend = false
 data = /var/lib/from-config
 archive-batch = 7
+auth-token = config-token-0123456789
 `)
 
 	result, err := parseServerArgs([]string{
@@ -168,6 +178,7 @@ archive-batch = 7
 		"-host", "127.0.0.1",
 		"-service-port", "9999",
 		"-frontend=true",
+		"-auth-token", "flag-token-0123456789",
 	}, filepath.Join(t.TempDir(), "absent.config"))
 	if err != nil {
 		t.Fatalf("parseServerArgs: %v", err)
@@ -193,6 +204,9 @@ archive-batch = 7
 	}
 	if result.Settings.ArchiveBatch != 7 {
 		t.Errorf("archive-batch = %d", result.Settings.ArchiveBatch)
+	}
+	if result.Settings.AuthToken != "flag-token-0123456789" {
+		t.Errorf("auth-token = %q", result.Settings.AuthToken)
 	}
 }
 

@@ -21,7 +21,7 @@ const (
 )
 
 // frontendHandler 提供静态页面和人看的 JSON 接口。
-func frontendHandler(b *bus.Bus) http.Handler {
+func frontendHandler(b *bus.Bus, a *auth) http.Handler {
 	sub, err := fs.Sub(webFS, "web")
 	if err != nil {
 		panic(err)
@@ -41,6 +41,12 @@ func frontendHandler(b *bus.Bus) http.Handler {
 	})
 
 	mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.FS(sub))))
+
+	// ---- 认证 ----
+
+	mux.HandleFunc("POST /api/login", a.login)
+	mux.HandleFunc("POST /api/logout", a.logout)
+	mux.HandleFunc("GET /api/session", a.session)
 
 	// ---- 页面用的 JSON ----
 
@@ -135,6 +141,94 @@ func frontendHandler(b *bus.Bus) http.Handler {
 		})
 	})
 
+	// ---- 管理操作 ----
+
+	const maxDeleteBatch = 1000
+
+	mux.HandleFunc("POST /api/events/delete", func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+		var body struct {
+			Events []bus.EventRef `json:"events"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid json: "+err.Error())
+			return
+		}
+		if len(body.Events) == 0 || len(body.Events) > maxDeleteBatch {
+			writeErr(w, http.StatusBadRequest, "events must contain 1-1000 items")
+			return
+		}
+		deleted, err := b.DeleteEvents(body.Events)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"deleted": deleted})
+	})
+
+	mux.HandleFunc("POST /api/producers/delete", func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+		var body struct {
+			Sources []string `json:"sources"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid json: "+err.Error())
+			return
+		}
+		if len(body.Sources) == 0 || len(body.Sources) > maxDeleteBatch {
+			writeErr(w, http.StatusBadRequest, "sources must contain 1-1000 items")
+			return
+		}
+		deleted, err := b.DeleteProducers(body.Sources)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"deleted": deleted})
+	})
+
+	mux.HandleFunc("POST /api/producers/hide", func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+		var body struct {
+			Sources []string `json:"sources"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid json: "+err.Error())
+			return
+		}
+		if len(body.Sources) == 0 || len(body.Sources) > maxDeleteBatch {
+			writeErr(w, http.StatusBadRequest, "sources must contain 1-1000 items")
+			return
+		}
+		hidden, err := b.HideProducers(body.Sources)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"hidden": hidden})
+	})
+
+	mux.HandleFunc("POST /api/consumers/delete", func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+		var body struct {
+			Names []string `json:"names"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid json: "+err.Error())
+			return
+		}
+		if len(body.Names) == 0 || len(body.Names) > maxDeleteBatch {
+			writeErr(w, http.StatusBadRequest, "names must contain 1-1000 items")
+			return
+		}
+		deleted, err := b.DeleteConsumers(body.Names)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"deleted": deleted})
+	})
+
 	mux.HandleFunc("GET /api/stats", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"events":    b.Len(),
@@ -203,5 +297,5 @@ func frontendHandler(b *bus.Bus) http.Handler {
 		}
 	})
 
-	return mux
+	return a.wrap(mux, authPublicFrontend, true)
 }

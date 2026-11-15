@@ -9,6 +9,7 @@ from tests.fake_server import FakeServer
 from yi import (
     Client,
     ConflictError,
+    Consumer,
     ConsumerStats,
     Event,
     Failure,
@@ -148,6 +149,122 @@ class ClientTests(unittest.TestCase):
             self.last_request["body"], {"types": ["other.created"]}
         )
 
+    def test_register_with_patterns_sends_normalized_payload(self) -> None:
+        stats = self.client.register(
+            "worker",
+            ["raw.captured"],
+            patterns=[" ^mail\\.", "^note$", "^mail\\.", "  "],
+        )
+
+        self.assertEqual(
+            self.last_request["body"],
+            {
+                "types": ["raw.captured"],
+                "patterns": ["^mail\\.", "^note$"],
+            },
+        )
+        self.assertEqual(self.last_request["status"], 201)
+        self.assertEqual(stats.types, ["raw.captured"])
+        self.assertEqual(stats.patterns, ("^mail\\.", "^note$"))
+
+        # An all-empty or omitted patterns argument keeps the legacy body.
+        self.client.register("legacy", ["raw.captured"], patterns=[])
+        self.assertEqual(
+            self.last_request["body"], {"types": ["raw.captured"]}
+        )
+        self.assertEqual(self.last_request["status"], 201)
+
+    def test_register_patterns_only(self) -> None:
+        stats = self.client.register("worker", [], patterns=["^note$"])
+
+        self.assertEqual(
+            self.last_request["body"],
+            {"types": [], "patterns": ["^note$"]},
+        )
+        self.assertEqual(self.last_request["status"], 201)
+        self.assertEqual(stats.types, [])
+        self.assertEqual(stats.patterns, ("^note$",))
+        self.assertEqual(stats.cursor, 0)
+
+    def test_patterns_only_consumer_matches_unanchored_or_anchored(self) -> None:
+        # Unanchored: the pattern matches anywhere in the event type.
+        stats = self.client.register("worker", [], patterns=[r"mail\."])
+        self.assertEqual(stats.patterns, (r"mail\.",))
+
+        ignored = Event.new("phone", types=["other.created"])
+        matching = Event.new("phone", types=["inbox.mail.received"])
+        self.assertEqual(self.client.publish(ignored).matched, 0)
+        self.assertEqual(self.client.publish(matching).matched, 1)
+
+        delivered = self.client.next("worker", timeout=0.05)
+        self.assertIsNotNone(delivered)
+        self.assertEqual(delivered.id, matching.id)
+        self.client.ack("worker", matching.id)
+
+        # Anchored: ^note$ accepts "note" but not "note.created".
+        anchored = self.client.register(
+            "notes", [], patterns=[r"^note$"]
+        )
+        self.assertEqual(anchored.types, [])
+        note = Event.new("phone", types=["note"])
+        nested = Event.new("phone", types=["note.created"])
+        self.assertEqual(self.client.publish(note).matched, 1)
+        self.assertEqual(self.client.publish(nested).matched, 0)
+        message = self.client.next("notes", timeout=0.05)
+        self.assertIsNotNone(message)
+        self.assertEqual(message.id, note.id)
+
+    def test_register_requires_a_type_or_pattern(self) -> None:
+        with self.assertRaises(HTTPError) as raised:
+            self.client.register("worker", [])
+        self.assertEqual(raised.exception.status, 400)
+        self.assertEqual(self.last_request["body"], {"types": []})
+
+        with self.assertRaises(HTTPError) as raised:
+            self.client.register("worker", [], patterns=["  "])
+        self.assertEqual(raised.exception.status, 400)
+        self.assertEqual(self.last_request["body"], {"types": []})
+
+    def test_register_rejects_invalid_pattern(self) -> None:
+        with self.assertRaises(HTTPError) as raised:
+            self.client.register("worker", [], patterns=["("])
+        self.assertEqual(raised.exception.status, 400)
+        self.assertIn("pattern", raised.exception.body)
+
+    def test_consumer_stats_patterns_parsing(self) -> None:
+        parsed = ConsumerStats.from_dict(
+            {
+                "name": "worker",
+                "types": [],
+                "patterns": ["^mail\\.", "^note$"],
+                "cursor": 3,
+                "pending": 1,
+                "delivered": 2,
+                "failed": 0,
+            }
+        )
+        self.assertEqual(parsed.patterns, ("^mail\\.", "^note$"))
+        self.assertEqual(
+            parsed.to_dict()["patterns"], ["^mail\\.", "^note$"]
+        )
+
+        # Older servers omit the field entirely.
+        legacy = ConsumerStats.from_dict(
+            {
+                "name": "old",
+                "types": ["raw.captured"],
+                "cursor": 0,
+                "pending": 0,
+                "delivered": 0,
+                "failed": 0,
+            }
+        )
+        self.assertEqual(legacy.patterns, ())
+        self.assertNotIn("patterns", legacy.to_dict())
+
+        with self.assertRaises(YiError):
+            ConsumerStats.from_dict({"name": "bad", "patterns": "nope"})
+
     def test_deregister(self) -> None:
         self.client.register("worker", ["raw.captured"])
         self.client.deregister("worker")
@@ -245,6 +362,73 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(
             set(event.to_dict()),
             {"id", "source", "types", "time", "data"},
+        )
+
+    def test_authorization_header_absent_by_default(self) -> None:
+        self.client.health()
+        self.assertNotIn("authorization", self.last_request["headers"])
+
+    def test_token_rejects_header_injection(self) -> None:
+        with self.assertRaises(YiError):
+            Client(self.server.url, token="a\r\nX-Evil: 1")
+
+    def test_authorization_header_is_sent_when_token_configured(self) -> None:
+        token = "s3cret-token"
+        self.server.state.auth_token = token
+        client = Client(self.server.url, timeout=2.0, token=token)
+
+        self.assertEqual(client.health(), "ok")
+
+        consumer = Consumer(client, "worker", ["raw.captured"], timeout=0.05)
+        first = Event.new("phone")
+        client.publish(first)
+        message = consumer.next()
+        self.assertIsNotNone(message)
+        message.ack()
+
+        second = Event.new("phone")
+        client.publish(second)
+        message = consumer.next()
+        self.assertIsNotNone(message)
+        message.nack("boom")
+
+        client.events(limit=1)
+        client.stats()
+        client.failures()
+        consumer.deregister()
+
+        expected = "Bearer " + token
+        self.assertTrue(self.server.state.requests)
+        for request in self.server.state.requests:
+            self.assertEqual(
+                request["headers"].get("authorization"),
+                expected,
+                "{} {} did not carry the bearer token".format(
+                    request["method"], request["path"]
+                ),
+            )
+
+        paths = {request["path"] for request in self.server.state.requests}
+        self.assertTrue(
+            {
+                "/healthz",
+                "/events",
+                "/consumers/worker",
+                "/consumers/worker/next",
+                "/consumers/worker/ack",
+                "/consumers/worker/nack",
+                "/stats",
+                "/failures",
+            }.issubset(paths)
+        )
+
+    def test_server_with_auth_rejects_client_without_token(self) -> None:
+        self.server.state.auth_token = "s3cret-token"
+        with self.assertRaises(HTTPError) as raised:
+            self.client.health()
+        self.assertEqual(raised.exception.status, 401)
+        self.assertNotIn(
+            "authorization", self.server.state.requests[-1]["headers"]
         )
 
 

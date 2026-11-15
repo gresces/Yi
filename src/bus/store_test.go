@@ -1,12 +1,160 @@
 package bus
 
 import (
+	"database/sql"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 )
+
+func TestOpenPersistsSubscriptionPatterns(t *testing.T) {
+	dir := t.TempDir()
+
+	b, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.SubscribePatterns("regex", nil, []string{`^mail\.`, `^note$`}); err != nil {
+		t.Fatal(err)
+	}
+	mustPublish(t, b, eventOf("mail", "mail.received"))
+	if err := b.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+
+	restored, ok := reopened.Consumer("regex")
+	if !ok {
+		t.Fatal("pattern consumer missing after reopen")
+	}
+	if got := restored.Patterns(); len(got) != 2 || got[0] != "^mail\\." || got[1] != "^note$" {
+		t.Fatalf("patterns = %#v", got)
+	}
+	if got := restored.Stats().Patterns; len(got) != 2 {
+		t.Fatalf("stats patterns = %#v", got)
+	}
+	m := mustNext(t, restored)
+	if m.Event.ID != "mail" {
+		t.Fatalf("next = %s, want mail", m.Event.ID)
+	}
+}
+
+func TestOpenMigratesLegacyEventsWithoutDeleted(t *testing.T) {
+	dir := t.TempDir()
+	db, err := sql.Open("sqlite", filepath.Join(dir, "yi.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+		CREATE TABLE events (
+			seq         INTEGER PRIMARY KEY,
+			received_at TEXT NOT NULL,
+			id          TEXT NOT NULL,
+			source      TEXT NOT NULL,
+			type        TEXT NOT NULL,
+			types       TEXT NOT NULL DEFAULT '[]',
+			"time"      TEXT NOT NULL,
+			data        TEXT NOT NULL,
+			UNIQUE (source, id)
+		)`); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+		INSERT INTO events (seq, received_at, id, source, type, types, "time", data)
+		VALUES (1, '2026-11-15T10:00:00Z', 'legacy', 'test', 'raw.captured',
+		        '["raw.captured"]', '2026-11-15T10:00:00Z', '{"text":"x"}')`); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	b, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := b.Len(); got != 1 {
+		t.Fatalf("len = %d, want 1", got)
+	}
+	if _, err := b.DeleteEvents([]EventRef{{ID: "legacy", Source: "test"}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := b.Len(); got != 0 {
+		t.Fatalf("len after delete = %d, want 0", got)
+	}
+	if err := b.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if got := reopened.Len(); got != 0 {
+		t.Fatalf("len after reopen = %d, want 0", got)
+	}
+}
+
+func TestOpenMigratesLegacyConsumersWithoutPatterns(t *testing.T) {
+	dir := t.TempDir()
+	db, err := sql.Open("sqlite", filepath.Join(dir, "yi.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+		CREATE TABLE consumers (
+			name       TEXT PRIMARY KEY,
+			types      TEXT NOT NULL,
+			cursor     INTEGER NOT NULL DEFAULT 0,
+			delivered  INTEGER NOT NULL DEFAULT 0,
+			failed     INTEGER NOT NULL DEFAULT 0,
+			last_error TEXT NOT NULL DEFAULT '',
+			last_event TEXT NOT NULL DEFAULT '',
+			last_at    TEXT NOT NULL DEFAULT ''
+		)`); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(
+		`INSERT INTO consumers (name, types) VALUES ('legacy', '["raw.captured"]')`,
+	); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	b, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	c, ok := b.Consumer("legacy")
+	if !ok {
+		t.Fatal("legacy consumer missing after migration")
+	}
+	if got := c.Patterns(); len(got) != 0 {
+		t.Fatalf("patterns = %#v", got)
+	}
+	if got := c.Types(); len(got) != 1 || got[0] != TypeRawCaptured {
+		t.Fatalf("types = %#v", got)
+	}
+	if _, err := b.SubscribePatterns("pattern", nil, []string{`^mail\.`}); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestOpenPersistsEventsAndCursors(t *testing.T) {
 	dir := t.TempDir()

@@ -5,7 +5,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -45,6 +47,7 @@ type Snapshot struct {
 type ConsumerStats struct {
 	Name      string      `json:"name"`
 	Types     []EventType `json:"types"`
+	Patterns  []string    `json:"patterns,omitempty"`
 	Cursor    int64       `json:"cursor"`
 	Pending   int         `json:"pending"`
 	Delivered uint64      `json:"delivered"`
@@ -109,9 +112,11 @@ func (m *Message) Nack(err error) error {
 
 // Consumer 是注册在总线上的拉取方。它只有一个游标,不持有 goroutine。
 type Consumer struct {
-	bus   *Bus
-	name  string
-	types map[EventType]struct{}
+	bus      *Bus
+	name     string
+	types    map[EventType]struct{}
+	patterns []string
+	compiled []*regexp.Regexp
 
 	cursor   int64 // 最后确认的 seq
 	inflight int64 // 已取出、尚未确认的 seq;0 表示没有
@@ -189,6 +194,14 @@ func (c *Consumer) Types() []EventType {
 	return sortedTypes(c.types)
 }
 
+// Patterns 返回这个消费者订阅的正则表达式。
+func (c *Consumer) Patterns() []string {
+	b := c.bus
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]string(nil), c.patterns...)
+}
+
 // Inflight 返回已取出但尚未确认的事件。
 func (c *Consumer) Inflight() (Event, bool) {
 	b := c.bus
@@ -229,6 +242,7 @@ type Bus struct {
 	mu       sync.Mutex
 	base     int64 // 已归档的最大 seq;活跃日志从 base+1 开始
 	log      []storedEvent
+	active   int // log 中未删除的事件数
 	seen     map[key]int64
 	subs     map[string]*Consumer
 	failures []Failure
@@ -241,6 +255,12 @@ type Bus struct {
 
 	metrics   map[int64]*metricBucket
 	producers map[string]*producerState
+	// hidden 是从生产者列表里移除、但事件仍保留的来源。发布新事件时自动恢复。
+	hidden map[string]struct{}
+
+	publishedTotal uint64
+	ackedTotal     uint64
+	nackedTotal    uint64
 }
 
 type key struct{ source, id string }
@@ -250,6 +270,7 @@ type storedEvent struct {
 	seq        int64
 	receivedAt time.Time
 	event      Event
+	deleted    bool
 }
 
 // New 创建一条空的内存总线。
@@ -267,6 +288,7 @@ func newBus(s store) *Bus {
 		byType:    make(map[EventType][]int64),
 		metrics:   make(map[int64]*metricBucket),
 		producers: make(map[string]*producerState),
+		hidden:    make(map[string]struct{}),
 	}
 }
 
@@ -293,12 +315,25 @@ func Open(dir string) (*Bus, error) {
 		}
 		b.log = append(b.log, se)
 		b.seen[key{source: se.event.Source, id: se.event.ID}] = se.seq
+		if se.deleted {
+			continue
+		}
+		b.active++
 		for _, t := range se.event.Types {
 			b.byType[t] = append(b.byType[t], se.seq)
 		}
 	}
 	for _, se := range b.log {
 		b.producerLocked(se.event.Source, se.receivedAt)
+	}
+
+	hidden, err := s.loadHiddenProducers()
+	if err != nil {
+		s.close()
+		return nil, err
+	}
+	for _, source := range hidden {
+		b.hidden[source] = struct{}{}
 	}
 
 	state, err := s.loadState()
@@ -318,7 +353,12 @@ func Open(dir string) (*Bus, error) {
 				types[t] = struct{}{}
 			}
 		}
-		if len(types) == 0 {
+		patterns, compiled, err := compilePatterns(cs.Patterns)
+		if err != nil {
+			s.close()
+			return nil, fmt.Errorf("bus: consumer %q patterns: %w", cs.Name, err)
+		}
+		if len(types) == 0 && len(patterns) == 0 {
 			continue
 		}
 		if _, exists := b.subs[cs.Name]; exists {
@@ -330,10 +370,13 @@ func Open(dir string) (*Bus, error) {
 		if last := b.base + int64(len(b.log)); cursor > last {
 			cursor = last
 		}
+
 		c := &Consumer{
 			bus:       b,
 			name:      cs.Name,
 			types:     types,
+			patterns:  patterns,
+			compiled:  compiled,
 			cursor:    cursor,
 			delivered: cs.Delivered,
 			failed:    cs.Failed,
@@ -350,11 +393,11 @@ func Open(dir string) (*Bus, error) {
 	return b, nil
 }
 
-// Len 返回日志中的事件总数。
+// Len 返回日志中未删除的事件总数。
 func (b *Bus) Len() int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return len(b.log)
+	return b.active
 }
 
 // Snapshot 原子地返回最近 limit 条事件和全部消费者状态。limit <= 0 时返回全部。
@@ -382,6 +425,9 @@ func (b *Bus) Snapshot(limit int) Snapshot {
 	out.Producers = make([]ProducerStat, 0, len(b.producers))
 	for source, p := range b.producers {
 		if p.count <= 0 {
+			continue
+		}
+		if _, hidden := b.hidden[source]; hidden {
 			continue
 		}
 		out.Producers = append(out.Producers, ProducerStat{
@@ -450,6 +496,71 @@ func (b *Bus) Metrics(window int) Metrics {
 	return out
 }
 
+// PrometheusStats 是 /metrics 所需的进程内快照。计数器从进程启动开始累计;
+// Prometheus 会在重启时自然识别 counter reset。
+type PrometheusStats struct {
+	Active         int
+	PublishedTotal uint64
+	AckedTotal     uint64
+	NackedTotal    uint64
+	Failures       int
+	Consumers      []ConsumerStats
+	Producers      []ProducerStat
+	Types          []TypeCount
+}
+
+func (b *Bus) PrometheusStats() PrometheusStats {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	out := PrometheusStats{
+		Active:         b.active,
+		PublishedTotal: b.publishedTotal,
+		AckedTotal:     b.ackedTotal,
+		NackedTotal:    b.nackedTotal,
+		Failures:       len(b.failures),
+		Consumers:      make([]ConsumerStats, 0, len(b.subs)),
+		Producers:      make([]ProducerStat, 0, len(b.producers)),
+		Types:          make([]TypeCount, 0, len(b.byType)),
+	}
+	for _, c := range b.subs {
+		out.Consumers = append(out.Consumers, b.statsLocked(c))
+	}
+	sort.Slice(out.Consumers, func(i, j int) bool {
+		return out.Consumers[i].Name < out.Consumers[j].Name
+	})
+
+	for source, producer := range b.producers {
+		if producer.count <= 0 {
+			continue
+		}
+		if _, hidden := b.hidden[source]; hidden {
+			continue
+		}
+		out.Producers = append(out.Producers, ProducerStat{
+			Source: source,
+			Count:  producer.count,
+			LastAt: formatTime(producer.lastAt),
+		})
+	}
+	sort.Slice(out.Producers, func(i, j int) bool {
+		return out.Producers[i].Source < out.Producers[j].Source
+	})
+
+	for typ, seqs := range b.byType {
+		if len(seqs) > 0 {
+			out.Types = append(out.Types, TypeCount{Type: typ, Count: len(seqs)})
+		}
+	}
+	sort.Slice(out.Types, func(i, j int) bool {
+		if out.Types[i].Count != out.Types[j].Count {
+			return out.Types[i].Count > out.Types[j].Count
+		}
+		return out.Types[i].Type < out.Types[j].Type
+	})
+	return out
+}
+
 // Watch 返回一个在总线状态变化时收到通知的通道,以及取消函数。
 // 通道容量为 1,多次变化会合并成一次唤醒。
 func (b *Bus) Watch() (<-chan struct{}, func()) {
@@ -512,12 +623,22 @@ func (b *Bus) Publish(e Event) (PublishResult, error) {
 
 	b.log = append(b.log, se)
 	b.seen[k] = seq
+	b.active++
 	for _, t := range e.Types {
 		b.byType[t] = append(b.byType[t], seq)
 	}
 
 	b.metricLocked(now).published++
+	b.publishedTotal++
 	b.producerLocked(e.Source, now)
+
+	// 隐藏过的来源又发布了,说明它重新活跃,放回生产者列表。
+	if _, ok := b.hidden[e.Source]; ok {
+		delete(b.hidden, e.Source)
+		if b.store != nil {
+			_ = b.store.unhideProducer(e.Source)
+		}
+	}
 
 	matched := 0
 	for _, c := range b.subs {
@@ -536,13 +657,196 @@ func (b *Bus) Publish(e Event) (PublishResult, error) {
 	return PublishResult{Matched: matched}, nil
 }
 
-// Subscribe 注册一个消费者。它不会启动任何 goroutine,由调用方拉取。
+// EventRef 按 (source, id) 指向一条事件。事件 id 只在同一个 source 内唯一。
+type EventRef struct {
+	ID     string `json:"id"`
+	Source string `json:"source"`
+}
+
+// DeleteEvents 把指定事件从活跃视图删除。底层日志保留 seq 以维持游标语义,
+// 但事件不再出现在分页、统计和消费者投递中。
+func (b *Bus) DeleteEvents(refs []EventRef) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.closed {
+		return 0, ErrClosed
+	}
+	seqs := make(map[int64]struct{}, len(refs))
+	for _, ref := range refs {
+		seq, ok := b.seen[key{source: ref.Source, id: ref.ID}]
+		if !ok || seq <= b.base || seq > b.base+int64(len(b.log)) {
+			continue
+		}
+		if b.log[seq-b.base-1].deleted {
+			continue
+		}
+		seqs[seq] = struct{}{}
+	}
+	return b.deleteSeqsLocked(seqs)
+}
+
+// DeleteProducers 删除指定来源的全部活跃事件。
+func (b *Bus) DeleteProducers(sources []string) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.closed {
+		return 0, ErrClosed
+	}
+	wanted := make(map[string]struct{}, len(sources))
+	for _, source := range sources {
+		if source != "" {
+			wanted[source] = struct{}{}
+		}
+	}
+	seqs := make(map[int64]struct{})
+	for i := range b.log {
+		se := b.log[i]
+		if se.deleted {
+			continue
+		}
+		if _, ok := wanted[se.event.Source]; ok {
+			seqs[se.seq] = struct{}{}
+		}
+	}
+	return b.deleteSeqsLocked(seqs)
+}
+
+// HideProducers 把来源从生产者列表里移除,但保留它们的事件。
+// 返回确实被隐藏的数量;之后某个来源再次发布事件,它会自动回到列表里。
+func (b *Bus) HideProducers(sources []string) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.closed {
+		return 0, ErrClosed
+	}
+
+	hidden := 0
+	var firstErr error
+	for _, source := range sources {
+		if source == "" {
+			continue
+		}
+		if _, ok := b.hidden[source]; ok {
+			continue
+		}
+		if p := b.producers[source]; p == nil || p.count <= 0 {
+			continue
+		}
+		if b.store != nil {
+			if err := b.store.hideProducer(source); err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+				continue
+			}
+		}
+		b.hidden[source] = struct{}{}
+		hidden++
+	}
+	if hidden > 0 {
+		b.notifyLocked()
+	}
+	return hidden, firstErr
+}
+
+// DeleteConsumers 删除多个消费者注册。返回成功删除的数量。
+func (b *Bus) DeleteConsumers(names []string) (int, error) {
+	deleted := 0
+	var firstErr error
+	seen := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		c, ok := b.Consumer(name)
+		if !ok {
+			continue
+		}
+		if err := c.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		deleted++
+	}
+	return deleted, firstErr
+}
+
+func (b *Bus) deleteSeqsLocked(seqs map[int64]struct{}) (int, error) {
+	if len(seqs) == 0 {
+		return 0, nil
+	}
+	ordered := make([]int64, 0, len(seqs))
+	for seq := range seqs {
+		ordered = append(ordered, seq)
+	}
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i] < ordered[j] })
+
+	if b.store != nil {
+		if err := b.store.deleteEvents(ordered); err != nil {
+			return 0, err
+		}
+	}
+
+	for _, seq := range ordered {
+		b.log[seq-b.base-1].deleted = true
+		if b.active > 0 {
+			b.active--
+		}
+	}
+	for _, c := range b.subs {
+		if _, ok := seqs[c.inflight]; ok {
+			c.inflight = 0
+		}
+		c.pending = b.countPendingLocked(c)
+		select {
+		case c.notify <- struct{}{}:
+		default:
+		}
+	}
+	for typ, seqsByType := range b.byType {
+		kept := seqsByType[:0]
+		for _, seq := range seqsByType {
+			if _, deleted := seqs[seq]; !deleted {
+				kept = append(kept, seq)
+			}
+		}
+		if len(kept) == 0 {
+			delete(b.byType, typ)
+		} else {
+			b.byType[typ] = kept
+		}
+	}
+	b.rebuildProducersLocked()
+	b.notifyLocked()
+	return len(ordered), nil
+}
+
+func (b *Bus) rebuildProducersLocked() {
+	b.producers = make(map[string]*producerState)
+	for _, se := range b.log {
+		if se.deleted {
+			continue
+		}
+		b.producerLocked(se.event.Source, se.receivedAt)
+	}
+}
+
+// Subscribe 注册一个按精确类型订阅的消费者。
 func (b *Bus) Subscribe(name string, types ...EventType) (*Consumer, error) {
+	return b.SubscribePatterns(name, types, nil)
+}
+
+// SubscribePatterns 注册一个消费者。types 是精确类型,patterns 是 Go RE2
+// 正则表达式,匹配事件的任意一个类型;两类条件取并集。
+func (b *Bus) SubscribePatterns(name string, types []EventType, patterns []string) (*Consumer, error) {
 	if name == "" {
 		return nil, errors.New("bus: consumer needs a name")
-	}
-	if len(types) == 0 {
-		return nil, errors.New("bus: consumer needs at least one type")
 	}
 
 	match := make(map[EventType]struct{}, len(types))
@@ -551,6 +855,14 @@ func (b *Bus) Subscribe(name string, types ...EventType) (*Consumer, error) {
 			return nil, errors.New("bus: empty event type")
 		}
 		match[t] = struct{}{}
+	}
+
+	normalizedPatterns, compiled, err := compilePatterns(patterns)
+	if err != nil {
+		return nil, err
+	}
+	if len(match) == 0 && len(normalizedPatterns) == 0 {
+		return nil, errors.New("bus: consumer needs at least one type or pattern")
 	}
 
 	b.mu.Lock()
@@ -564,11 +876,13 @@ func (b *Bus) Subscribe(name string, types ...EventType) (*Consumer, error) {
 	}
 
 	c := &Consumer{
-		bus:    b,
-		name:   name,
-		types:  match,
-		notify: make(chan struct{}, 1),
-		done:   make(chan struct{}),
+		bus:      b,
+		name:     name,
+		types:    match,
+		patterns: normalizedPatterns,
+		compiled: compiled,
+		notify:   make(chan struct{}, 1),
+		done:     make(chan struct{}),
 	}
 	c.pending = b.countPendingLocked(c)
 	b.subs[name] = c
@@ -636,6 +950,10 @@ func (b *Bus) archiveLocked(upto int64) error {
 		n = len(b.log)
 	}
 	for i := 0; i < n; i++ {
+		if b.log[i].deleted {
+			continue
+		}
+		b.active--
 		src := b.log[i].event.Source
 		if p := b.producers[src]; p != nil {
 			p.count--
@@ -708,7 +1026,7 @@ func (b *Bus) pageLocked(limit, offset int, typ EventType) ([]Event, int) {
 	}
 
 	if typ == "" {
-		total := len(b.log)
+		total := b.active
 		end := total - offset
 		if end < 0 {
 			end = 0
@@ -719,10 +1037,20 @@ func (b *Bus) pageLocked(limit, offset int, typ EventType) ([]Event, int) {
 		}
 
 		out := make([]Event, 0, end-start)
-		for _, se := range b.log[start:end] {
-			e := se.event
-			e.Data = bytes.Clone(e.Data)
-			out = append(out, e)
+		seen := 0
+		for _, se := range b.log {
+			if se.deleted {
+				continue
+			}
+			seen++
+			if seen > start && seen <= end {
+				e := se.event
+				e.Data = bytes.Clone(e.Data)
+				out = append(out, e)
+			}
+			if seen >= end {
+				break
+			}
 		}
 		return out, total
 	}
@@ -865,7 +1193,66 @@ func (c *Consumer) matchesTypes(types []EventType) bool {
 			return true
 		}
 	}
+	for _, pattern := range c.compiled {
+		for _, t := range types {
+			if pattern.MatchString(string(t)) {
+				return true
+			}
+		}
+	}
 	return false
+}
+
+const (
+	maxSubscriptionPatterns   = 64
+	maxSubscriptionPatternLen = 512
+)
+
+// NormalizePatterns trims, validates, de-duplicates and sorts subscription
+// patterns. Patterns are Go RE2 regular expressions and match any one event
+// type when applied with MatchString (add ^/$ for a full match).
+func NormalizePatterns(patterns []string) ([]string, error) {
+	if len(patterns) > maxSubscriptionPatterns {
+		return nil, fmt.Errorf("bus: too many subscription patterns (max %d)", maxSubscriptionPatterns)
+	}
+
+	seen := make(map[string]struct{}, len(patterns))
+	out := make([]string, 0, len(patterns))
+	for _, raw := range patterns {
+		pattern := strings.TrimSpace(raw)
+		if pattern == "" {
+			return nil, errors.New("bus: empty subscription pattern")
+		}
+		if len(pattern) > maxSubscriptionPatternLen {
+			return nil, fmt.Errorf("bus: subscription pattern is too long (max %d bytes)", maxSubscriptionPatternLen)
+		}
+		if _, err := regexp.Compile(pattern); err != nil {
+			return nil, fmt.Errorf("bus: invalid subscription pattern %q: %w", pattern, err)
+		}
+		if _, ok := seen[pattern]; ok {
+			continue
+		}
+		seen[pattern] = struct{}{}
+		out = append(out, pattern)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+func compilePatterns(patterns []string) ([]string, []*regexp.Regexp, error) {
+	normalized, err := NormalizePatterns(patterns)
+	if err != nil {
+		return nil, nil, err
+	}
+	compiled := make([]*regexp.Regexp, 0, len(normalized))
+	for _, pattern := range normalized {
+		re, err := regexp.Compile(pattern)
+		if err != nil {
+			return nil, nil, fmt.Errorf("bus: invalid subscription pattern %q: %w", pattern, err)
+		}
+		compiled = append(compiled, re)
+	}
+	return normalized, compiled, nil
 }
 
 // metricLocked 返回当前秒的吞吐量桶。
@@ -915,7 +1302,7 @@ func parseTime(raw string) time.Time {
 func (b *Bus) countPendingLocked(c *Consumer) int {
 	n := 0
 	for _, se := range b.log {
-		if se.seq > c.cursor && c.matches(se.event) {
+		if !se.deleted && se.seq > c.cursor && c.matches(se.event) {
 			n++
 		}
 	}
@@ -944,7 +1331,7 @@ func (c *Consumer) tryNext() (*Message, error) {
 
 	for i := start; i < int64(len(b.log)); i++ {
 		se := b.log[i]
-		if !c.matches(se.event) {
+		if se.deleted || !c.matches(se.event) {
 			continue
 		}
 		c.inflight = se.seq
@@ -996,6 +1383,7 @@ func (c *Consumer) settle(seq int64, failure error) error {
 	if failure == nil {
 		c.delivered++
 		b.metricLocked(now).acked++
+		b.ackedTotal++
 		b.notifyLocked()
 		err := b.saveConsumerLocked(c)
 		b.maybeArchiveLocked()
@@ -1006,6 +1394,7 @@ func (c *Consumer) settle(seq int64, failure error) error {
 	c.lastErr = failure.Error()
 	c.lastAt = now
 	b.metricLocked(now).failed++
+	b.nackedTotal++
 	f := Failure{
 		Consumer: c.name,
 		EventID:  e.ID,
@@ -1031,6 +1420,7 @@ func (b *Bus) statsLocked(c *Consumer) ConsumerStats {
 	return ConsumerStats{
 		Name:      c.name,
 		Types:     sortedTypes(c.types),
+		Patterns:  append([]string(nil), c.patterns...),
 		Cursor:    c.cursor,
 		Pending:   c.pending,
 		Delivered: c.delivered,
@@ -1080,6 +1470,7 @@ func (b *Bus) saveConsumerLocked(c *Consumer) error {
 	return b.store.saveConsumer(ConsumerState{
 		Name:      c.name,
 		Types:     sortedTypes(c.types),
+		Patterns:  append([]string(nil), c.patterns...),
 		Cursor:    c.cursor,
 		Delivered: c.delivered,
 		Failed:    c.failed,

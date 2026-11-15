@@ -8,6 +8,7 @@ condition variable for long-polling.
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 from datetime import datetime, timezone
@@ -22,6 +23,21 @@ def _rfc3339_now() -> str:
     )
 
 
+def _subscription_matches(
+    consumer: Dict[str, Any], event_types: Any
+) -> bool:
+    """Union of exact type matches and unanchored pattern matches."""
+    types = set(event_types or ())
+    if types & set(consumer.get("types") or ()):
+        return True
+    for pattern in consumer.get("patterns") or ():
+        compiled = re.compile(pattern)
+        for event_type in types:
+            if compiled.search(event_type):
+                return True
+    return False
+
+
 class FakeState:
     """Thread-safe in-memory state of the fake service."""
 
@@ -32,12 +48,19 @@ class FakeState:
         self.consumers: Dict[str, Dict[str, Any]] = {}
         self.failures: List[Dict[str, Any]] = []
         self.requests: List[Dict[str, Any]] = []
+        # When set, every endpoint requires ``Authorization: Bearer <token>``.
+        self.auth_token: Optional[str] = None
         # Test hooks: sleep before handling, or return a raw error response.
         self.delay = 0.0
         self.raw_error: Optional[Tuple[int, bytes]] = None
 
     def record(
-        self, method: str, path: str, query: Dict[str, List[str]], raw_body: bytes
+        self,
+        method: str,
+        path: str,
+        query: Dict[str, List[str]],
+        raw_body: bytes,
+        headers: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         try:
             body: Any = json.loads(raw_body.decode("utf-8")) if raw_body else None
@@ -49,6 +72,10 @@ class FakeState:
             "query": query,
             "body": body,
             "raw_body": raw_body,
+            # Header names are lower-cased so tests can look them up reliably.
+            "headers": {
+                name.lower(): value for name, value in (headers or {}).items()
+            },
             "status": None,
         }
         with self.condition:
@@ -67,6 +94,8 @@ class FakeState:
             "delivered": consumer["delivered"],
             "failed": consumer["failed"],
         }
+        if consumer["patterns"]:
+            stats["patterns"] = list(consumer["patterns"])
         if consumer["last_error"]:
             stats["last_error"] = consumer["last_error"]
         if consumer["last_event"]:
@@ -96,7 +125,19 @@ class _FakeHandler(BaseHTTPRequestHandler):
         segments = [unquote(part) for part in parsed.path.split("/") if part]
         query = parse_qs(parsed.query)
         raw_body = self._read_body()
-        self._entry = self.state.record(method, parsed.path, query, raw_body)
+        self._entry = self.state.record(
+            method,
+            parsed.path,
+            query,
+            raw_body,
+            {name: value for name, value in self.headers.items()},
+        )
+
+        if self.state.auth_token is not None:
+            expected = "Bearer " + self.state.auth_token
+            if self.headers.get("Authorization") != expected:
+                self._write_json(401, {"error": "unauthorized"})
+                return
 
         if self.state.delay:
             time.sleep(self.state.delay)
@@ -263,7 +304,7 @@ class _FakeHandler(BaseHTTPRequestHandler):
             matched = sum(
                 1
                 for consumer in self.state.consumers.values()
-                if event_types & set(consumer["types"])
+                if _subscription_matches(consumer, event_types)
             )
             status = 200 if duplicate else 201
             self._write_json(
@@ -311,29 +352,74 @@ class _FakeHandler(BaseHTTPRequestHandler):
             self._write_json(400, {"error": "invalid json: {}".format(exc)})
             return
 
-        types = payload.get("types") if isinstance(payload, dict) else None
-        if (
-            not isinstance(types, list)
-            or not types
-            or not all(isinstance(item, str) and item for item in types)
+        if not isinstance(payload, dict):
+            self._write_json(400, {"error": "body must be a JSON object"})
+            return
+
+        types_raw = payload.get("types")
+        if types_raw is None:
+            types = []
+        elif isinstance(types_raw, list) and all(
+            isinstance(item, str) and item for item in types_raw
         ):
+            types = list(types_raw)
+        else:
             self._write_json(
-                400, {"error": "types must be a non-empty array of strings"}
+                400, {"error": "types must be an array of non-empty strings"}
             )
+            return
+
+        patterns_raw = payload.get("patterns")
+        if patterns_raw is None:
+            patterns = []
+        elif isinstance(patterns_raw, list) and all(
+            isinstance(item, str) for item in patterns_raw
+        ):
+            patterns = []
+            seen = set()
+            for item in patterns_raw:
+                text = item.strip()
+                if not text:
+                    self._write_json(
+                        400, {"error": "empty subscription pattern"}
+                    )
+                    return
+                try:
+                    re.compile(text)
+                except re.error as exc:
+                    self._write_json(
+                        400, {"error": "invalid pattern {!r}: {}".format(text, exc)}
+                    )
+                    return
+                if text in seen:
+                    continue
+                seen.add(text)
+                patterns.append(text)
+            patterns.sort()
+        else:
+            self._write_json(
+                400, {"error": "patterns must be an array of strings"}
+            )
+            return
+
+        if not types and not patterns:
+            self._write_json(400, {"error": "types or patterns is required"})
             return
 
         with self.state.condition:
             existing = self.state.consumers.get(name)
             if existing is not None:
-                if set(existing["types"]) == set(types):
+                if (
+                    set(existing["types"]) == set(types)
+                    and existing["patterns"] == patterns
+                ):
                     self._write_json(200, self.state.stats_locked(existing))
                 else:
                     self._write_json(
                         409,
                         {
-                            "error": "consumer {!r} already exists with different types".format(
-                                name
-                            )
+                            "error": "consumer {!r} already exists with a "
+                            "different subscription".format(name)
                         },
                     )
                 return
@@ -341,6 +427,7 @@ class _FakeHandler(BaseHTTPRequestHandler):
             consumer = {
                 "name": name,
                 "types": list(types),
+                "patterns": patterns,
                 "cursor": 0,
                 "delivered": 0,
                 "failed": 0,
@@ -386,8 +473,8 @@ class _FakeHandler(BaseHTTPRequestHandler):
 
                 index: Optional[int] = None
                 for i in range(consumer["cursor"], len(self.state.events)):
-                    event_types = set(self.state.events[i].get("types") or [])
-                    if event_types & set(consumer["types"]):
+                    event_types = self.state.events[i].get("types") or []
+                    if _subscription_matches(consumer, event_types):
                         index = i
                         break
 

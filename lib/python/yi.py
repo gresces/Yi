@@ -21,7 +21,7 @@ from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import quote
 from uuid import uuid4
 
-__version__ = "0.1.1"
+__version__ = "0.1.5"
 
 __all__ = [
     "Client",
@@ -97,6 +97,24 @@ def _normalize_types(types: Sequence[str]) -> Tuple[str, ...]:
         seen.add(text)
         out.append(text)
     return tuple(sorted(out))
+
+
+def _normalize_patterns(patterns: Optional[Sequence[str]]) -> List[str]:
+    """Trim, drop empties, dedupe and sort subscription patterns.
+
+    The server normalizes patterns the same way; doing it locally keeps the
+    request body stable and makes an all-empty input fall back to omitting the
+    field. Pattern syntax itself is validated by the server (Go RE2).
+    """
+    out = []
+    seen = set()
+    for value in patterns or ():
+        text = str(value).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+    return sorted(out)
 
 
 def _format_timeout(value: float) -> str:
@@ -203,7 +221,12 @@ class PublishResult:
 
 @dataclass(frozen=True)
 class ConsumerStats:
-    """A snapshot of a registered consumer's progress."""
+    """A snapshot of a registered consumer's progress.
+
+    Attributes:
+        patterns: The Go RE2 patterns this consumer subscribes to, if any.
+            Older servers omit the field, in which case it is an empty tuple.
+    """
 
     name: str
     types: List[str]
@@ -213,6 +236,7 @@ class ConsumerStats:
     failed: int
     last_error: Optional[str] = None
     last_event: Optional[str] = None
+    patterns: Tuple[str, ...] = ()
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "ConsumerStats":
@@ -226,6 +250,14 @@ class ConsumerStats:
             types = [str(item) for item in types_raw]
         else:
             raise YiError("consumer stats types must be a JSON array")
+
+        patterns_raw = raw.get("patterns")
+        if patterns_raw is None:
+            patterns: Tuple[str, ...] = ()
+        elif isinstance(patterns_raw, (list, tuple)):
+            patterns = tuple(str(item) for item in patterns_raw)
+        else:
+            raise YiError("consumer stats patterns must be a JSON array")
 
         last_error = raw.get("last_error")
         if last_error is not None:
@@ -243,6 +275,7 @@ class ConsumerStats:
             failed=_as_int(raw, "failed"),
             last_error=last_error,
             last_event=last_event,
+            patterns=patterns,
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -259,6 +292,8 @@ class ConsumerStats:
             out["last_error"] = self.last_error
         if self.last_event is not None:
             out["last_event"] = self.last_event
+        if self.patterns:
+            out["patterns"] = list(self.patterns)
         return out
 
 
@@ -306,14 +341,23 @@ class Client:
         timeout: Socket timeout for ordinary requests, in seconds. For
             ``next()`` the socket timeout is extended past the server-side
             long-poll timeout so the server can answer 204 first.
+        token: Optional bearer token. When non-empty, every request carries
+            ``Authorization: Bearer <token>``. The empty default leaves
+            requests untouched, which matches a server without ``auth-token``.
     """
 
     def __init__(
-        self, base_url: str = "http://127.0.0.1:8081", timeout: float = 10.0
+        self,
+        base_url: str = "http://127.0.0.1:8081",
+        timeout: float = 10.0,
+        token: str = "",
     ) -> None:
         """Create a client for the service at ``base_url``."""
         self._base_url = base_url.rstrip("/")
         self._timeout = float(timeout)
+        self._token = str(token or "")
+        if "\r" in self._token or "\n" in self._token:
+            raise YiError("token must not contain CR or LF")
 
     # ---- HTTP plumbing ----
 
@@ -332,6 +376,8 @@ class Client:
         """
         url = self._base_url + path
         headers = {"Accept": "application/json"}
+        if self._token:
+            headers["Authorization"] = "Bearer " + self._token
         data = None
         if body is not None:
             data = json.dumps(body, ensure_ascii=False).encode("utf-8")
@@ -466,13 +512,30 @@ class Client:
         _, data = self._request("GET", "/failures")
         return [Failure.from_dict(item) for item in self._parse_list(data, "failures")]
 
-    def register(self, name: str, types: Sequence[str]) -> ConsumerStats:
+    def register(
+        self,
+        name: str,
+        types: Sequence[str],
+        patterns: Optional[Sequence[str]] = None,
+    ) -> ConsumerStats:
         """Register a consumer, or verify an existing registration.
 
+        ``types`` match event types exactly; ``patterns`` are Go RE2 regular
+        expressions matched against each event type (unanchored unless the
+        pattern uses ``^``/``$``). Subscriptions are the union of both.
+        At least one non-empty type or pattern is required. The ``patterns``
+        field is omitted from the request when it is empty, so existing
+        servers that only understand ``types`` keep working.
+
         Raises:
-            ConflictError: The name exists with a different set of types.
+            ConflictError: The name exists with a different subscription.
+            HTTPError: The server rejected the body, for example an invalid
+                pattern (HTTP 400).
         """
-        payload = {"types": list(types)}
+        payload: Dict[str, Any] = {"types": list(types)}
+        normalized = _normalize_patterns(patterns)
+        if normalized:
+            payload["patterns"] = normalized
         _, data = self._request(
             "PUT", self._consumer_path(name), body=payload
         )
@@ -563,15 +626,27 @@ class Consumer:
         name: str,
         types: Sequence[str],
         *,
+        patterns: Sequence[str] = (),
         timeout: float = 25.0
     ) -> None:
-        """Register ``name`` for ``types`` and create a local consumer."""
+        """Register ``name`` for ``types`` and/or ``patterns``.
+
+        ``types`` are exact event types and ``patterns`` are Go RE2 regular
+        expressions matched against event types. Either may be empty, but not
+        both. The subscription is the union of the two.
+        """
         self._client = client
         self._name = name
         self._types: List[str] = list(types)
+        self._patterns: List[str] = _normalize_patterns(patterns)
         self._timeout = float(timeout)
         self._closed = False
-        client.register(name, self._types)
+        client.register(name, self._types, self._patterns)
+
+    @property
+    def patterns(self) -> Tuple[str, ...]:
+        """The normalized regex patterns this consumer subscribes to."""
+        return tuple(self._patterns)
 
     def __enter__(self) -> "Consumer":
         """Return this consumer for use in a ``with`` statement."""
